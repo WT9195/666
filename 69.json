@@ -1,1 +1,40 @@
-
+{
+  "sites": [
+    {
+      "name": "uaa┃🔞",
+      "key": "uaa",
+      "type": 3,
+      "api": "./py/uaa视频.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "changeable": 1
+    },
+    {
+      "name": "心动┃🔞",
+      "key": "心动",
+      "type": 3,
+      "api": "./py/怦然心动.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "changeable": 1
+    },
+    {
+      "name": "香蕉┃🔞",
+      "key": "香蕉",
+      "type": 3,
+      "api": "./py/香蕉视频.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "changeable": 1
+    },
+    {
+      "name": "熊猫┃🔞",
+      "key": "熊猫",
+      "type": 3,
+      "api": "./py/熊猫视频.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "changeable": 1
+    }
+  ]
+}
