@@ -4,30 +4,33 @@
  小山影视源 · CatVod / Box  Python Spider
 ================================================================================
  后端   : http://43.248.128.122:578
- 账号   : sukeke / sukeke.1   (已内置,可在 init 参数中覆盖)
+ 认证   : 无需账号 / 密码 / 登录 / jwt —— 全链路只依赖 security/init 签发的 session_id
+ 版本   : v1.2 去账号密码版(基于 v1.1 修复版精简,已删除全部登录相关代码)
+          实测 7 组(错密码/空密码/去字段/全空/去 token)init 均返回 session_id;
+          ticket 只认 session_id,search/detail/parse 均不校验 jwt。
+          session 按 expires_in(600s) 提前刷新;含 urllib.request 与票据转义容错。
  依赖   : requests (无则退回 urllib)
 
- 已完整验证的链路
+ 已完整验证的链路(全程无需登录 / 账号 / 密码 / jwt)
  ----------------------------------------------------------------------------
-  1. 登录       POST /api/v1/user/login      {"Username","Password","device_id"}
-  2. 密钥交换   GET  /api/v1/security/challenge  →  POST /api/v1/security/init
-                → session_id + sign_key
-  3. 列表/搜索  GET  /api/v1/search?wd=*&type=<分类>&page=<页>
+  1. 密钥交换   GET  /api/v1/security/challenge  →  POST /api/v1/security/init
+                → session_id + sign_key (唯一必需凭证,有效期 600s)
+  2. 列表/搜索  GET  /api/v1/search?wd=*&type=<分类>&page=<页>
                 → data.hits[]   (wd=* 为通配,配合 type 即分类全量)
-  4. 详情       GET  /api/v1/video/detail?id=<vod_id>
+  3. 详情       GET  /api/v1/video/detail?id=<vod_id>
                 → data.vod_info.vod_url_with_player[]  每条线路带 tk 票根
-  5. 换票       POST /api/v1/vod/ticket       body {"token": "<tk完整值>"}
+  4. 换票       POST /api/v1/vod/ticket       body {"token": "<tk票根>"}
                 → data.ticket  (play_ticket, 内含 parse_api / data.url / 有效期)
-  6. 取流       按 parse_api 分三种形态解析:
+  5. 取流       按 parse_api 分三种形态解析:
                  · 相对路径  /api/v1/vod/parse?code=..&t=..&url=
                         → 拼 BASE 后 GET,服务端直接吐播放地址
                  · 外部解析  https://.../json_api.php?key=..&vid={md5}
                         → {md5} 用 data.url 替换,返回 JSON 取 url
                  · 外部解析  https://.../api/?key=..&url=
                         → url= 后拼 data.url,返回 JSON 取 url
-  7. 推荐       GET  /api/v1/video/recommend?id=<vod_id>
+  6. 推荐       GET  /api/v1/video/recommend?id=<vod_id>
 
- 注意:device_id 必须与账号已绑定的设备一致(每个新 device_id 占一个设备配额,
+ 注意:device_id 为固定设备号,不要随意更换(每个新号占一个设备配额,
       超了会报"设备数量已达上限")。下方已预置可用设备号。
 ================================================================================
 """
@@ -38,6 +41,7 @@ import base64
 import hashlib
 import hmac
 import urllib.parse
+import urllib.request
 import os
 import random
 
@@ -89,9 +93,9 @@ _INIT_FILLER = {
 class Spider(BaseSpider):
     CONFIG = {
         "base": "http://43.248.128.122:578",
-        "username": "sukeke",
-        "password": "sukeke.1",
-        # 账号 sukeke 已绑定的设备号,换账号请改成自己的
+        # 无账号密码:实测 challenge/init/search/detail/ticket/parse 全链路
+        # 都不校验 jwt 或账号身份,唯一必需的是 security/init 签发的 session_id。
+        # 固定设备号(握手与设备配额用),不要随意更换。
         "device_id": "de94cd65-a825-4972-adf9-7dbece13e9f1",
         "timeout": 30,
         "user_agent": "Mozilla/5.0 (Linux; Android 12) okhttp/3.12.1",
@@ -104,13 +108,14 @@ class Spider(BaseSpider):
         self.cfg = dict(self.CONFIG)
         self.base = self.CONFIG["base"].rstrip("/")
         self.device_id = ""
-        self.jwt = ""
         self.session_id = ""
         self.sign_key = ""
         self._types = []
         self._http = None
         self._lines = []          # 上次详情里的线路顺序(用于降级)
         self._tkmap = {}          # tk -> {"name","code","ep"} 索引
+        self._session_ttl = 600       # 握手下发的有效期 expires_in
+        self._session_expire_at = 0   # session 到期时间戳
 
     # ================================================================= 基础
     def getName(self):
@@ -173,8 +178,6 @@ class Spider(BaseSpider):
     # ================================================================= HTTP
     def _headers(self, extra=None):
         h = {"User-Agent": self.cfg.get("user_agent", "okhttp/3.12.1")}
-        if self.jwt:
-            h["Authorization"] = "Bearer " + self.jwt
         if self.session_id:
             h["X-Session-Id"] = self.session_id
         if extra:
@@ -236,20 +239,12 @@ class Spider(BaseSpider):
         return 0, last
 
     # ================================================================= 会话
-    def _login(self):
-        r = self._post("/api/v1/user/login", {
-            "Username": self.cfg.get("username"),
-            "Password": self.cfg.get("password"),
-            "device_id": self.device_id,
-        })
-        if r.get("code") == 1 and isinstance(r.get("data"), dict):
-            t = r["data"].get("token")
-            if t:
-                self.jwt = t
-                return True
-        return False
-
     def _handshake(self):
+        """security/init 密钥交换 —— 全链路唯一必需的凭证来源。
+
+        实测:该接口不校验 jwt、不校验账号密码,只要 device_id + challenge
+        就能签发 session_id(expires_in=600)。故本版本不含任何账号密码。
+        """
         ch = self._get("/api/v1/security/challenge")
         if ch.get("code") != 1 or not isinstance(ch.get("data"), dict):
             return False
@@ -262,12 +257,9 @@ class Spider(BaseSpider):
             "challenge": challenge,
             "challenge_id": cid,
             "device_id": self.device_id,
-            "token": self.jwt,
             "client_token": "",
             "timestamp": int(time.time()),
             "nonce": uuid.uuid4().hex,
-            "username": self.cfg.get("username"),
-            "password": self.cfg.get("password"),
         }
         payload.update(_INIT_FILLER)
 
@@ -275,15 +267,27 @@ class Spider(BaseSpider):
         if r.get("code") == 1 and isinstance(r.get("data"), dict):
             self.session_id = r["data"].get("session_id") or ""
             self.sign_key = r["data"].get("sign_key") or ""
+            try:
+                self._session_ttl = int(r["data"].get("expires_in") or 600)
+            except Exception:
+                self._session_ttl = 600
             return bool(self.session_id)
         return False
 
     def _ensure_session(self):
-        if not self.jwt and not self._login():
-            return False
-        if not self.session_id and not self._handshake():
-            return False
-        return True
+        """保证 session_id 有效(播放链路唯一必需,无需登录 / 账号 / 密码)。
+
+        session 为空或距到期不足 60 秒就重新握手(expires_in=600);
+        不再有任何登录调用,因此不存在重试风暴或账号锁定问题。
+        """
+        now = time.time()
+        if not self.session_id or now >= self._session_expire_at - 60:
+            try:
+                if self._handshake():
+                    self._session_expire_at = time.time() + max(60, self._session_ttl)
+            except Exception:
+                pass
+        return bool(self.session_id)
 
     def _sign_headers(self, path, body=""):
         """基于 sign_key 的设备签名(服务端 sign_policy=observe,属扩展用途)"""
@@ -482,7 +486,9 @@ class Spider(BaseSpider):
         if not pl:
             return None, "票据解析失败"
         d = pl.get("data") or {}
-        api = str(d.get("parse_api") or "").replace("\\u00026", "&")
+        api = str(d.get("parse_api") or "")
+        # 票据里的连接符可能被写成转义序列(旧版还多写了一个 0),统一还原
+        api = api.replace("\\u00026", "&").replace("\\u0026", "&")
         du = str(d.get("url") or "")
         if not api or not du:
             return None, "无解析配置"
@@ -568,8 +574,7 @@ if __name__ == "__main__":
     s.init("")
     print("name    :", s.getName())
     print("device  :", s.device_id)
-    print("jwt     :", (s.jwt or "")[:36], "...")
-    print("session :", s.session_id)
+    print("session :", s.session_id, " 有效期 %ss" % s._session_ttl)
 
     h = s.homeContent(False)
     print("\n分类    :", [(c["type_id"], c["type_name"]) for c in h.get("class", [])])

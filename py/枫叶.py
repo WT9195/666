@@ -1,355 +1,1296 @@
 # -*- coding: utf-8 -*-
-import datetime, html, json, re, struct, time, zlib, requests
-from base.spider import Spider as BaseSpider
+"""
+枫叶影院 / 枫叶4K 合并版 (maple.py)
+------------------------------------
+合并自 maple/ 目录下多个版本:
+  * 枫叶影院.py  —— 动态发布页 host + 多站点 + extend 兼容 + 稳健二次解析播放
+  * 枫叶4k.py    —— parse_map 多线路解析 / 4K 标识提取
+  * 枫叶.py      —— /index.php/ajax/data JSON 分类回调(规避 cupfox-list 验证码)
+
+2026-09-27 多线路播放修复:
+   * 解析线路表改从站点 /static/js/playerconfig.js 的 player_list 读取
+     (ps=1 需二次解析 / ps=0 直连), 站点不可达时用内置默认副本
+   * 修复原先只认 YYNB/JD4K 两个 key 导致 蓝光2k(co) 蓝光2k-2(vwnet) 等线路
+     被全部强制走 JD4K 域名, 解析服务拒绝后整条线路不可用
+   * 指定域名失败时按 parse_pool 顺序换用其余解析域名
+   * 补齐 encrypt=1/2 的解码处理
+
+2026-11-12 搜索修复:
+   * /index.php/ajax/suggest 联想接口已被站点关闭(code 999), 删除该死分支
+   * 搜索页被 MacCMS「系统安全验证」图形验证码拦截, 且静态 Cookie
+     verify_success=1 会干扰 /captcha.php 的会话校验(实测致验证码永远提交失败)
+   * 修复: 持久 Session(不带静态 Cookie) + /captcha.php 拉图 -> 内置字形模板
+     纯标准库识别(固定字体 4 位数字, 实测 5/5 通过) -> 提交 -> 同会话重试搜索
+   * 站点对短间隔连续搜索限频(返回空结果页), 加最小间隔节流 + 空结果自动重试
+"""
+import os
+import re
+import json
+import time
+import requests
+import base64
+import struct
+import zlib
+import urllib.parse
+from datetime import datetime
+
+import requests
 from bs4 import BeautifulSoup
 
-SITES, TAG, UA = ['https://maihaolian.com', "https://zzztool.com"], "枫叶4K", "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 Chrome/150.0.0.0 Mobile"
-SITE = SITES[0]
-HDRS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "zh-CN,zh;q=0.9", "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none", "Upgrade-Insecure-Requests": "1", "Referer": SITE + "/"}
-
 try:
-    BeautifulSoup("<p></p>", 'lxml'); BS_PARSER = 'lxml'
-except Exception: BS_PARSER = 'html.parser'
+    from base.spider import Spider as BaseSpider
+except ImportError:
+    class BaseSpider(object):
+        def getName(self): return ''
+        def init(self, extend=''): pass
+        def homeContent(self, filter=False): return {"class": [], "list": [], "filters": {}}
+        def homeVideoContent(self): return {"list": []}
+        def categoryContent(self, tid, pg, filter=False, extend=''): return {"list": []}
+        def detailContent(self, ids): return {"list": []}
+        def searchContent(self, key, quick, pg='1'): return {"list": []}
+        def playerContent(self, flag, id, vipFlags=None): return {"parse": 0, "url": ""}
+        def localProxy(self, param=''): return {}
+        def isVideoFormat(self, url): return False
+        def manualVideoCheck(self): return False
+        def destroy(self): pass
 
-RE_PLAYER_AAAA, RE_URL_VAR = re.compile(r'var\s+player_aaaa[\s\S]*?"url"\s*:\s*"([^"]+)"'), re.compile(r'url\s*[:=]\s*["\'](http[^"\']+)["\']')
-RE_TOKEN, RE_PAGE_NEXT = re.compile(r'data-te="([^"]+)"'), re.compile(r'\d+')
-RE_PAGE_TIP, RE_LINE_KEY, RE_WHITESPACE = re.compile(r'\d+/(\d+)页'), re.compile(r'[-_]'), re.compile(r'\s+')
 
-CAP_TPL = {
-    0: [0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045],
-    1: [1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, -0.5504, -1.1933, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933],
-    2: [0.8165, 0.8165, -1.2247, -1.2247, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247],
-    3: [0.7954, -1.2572, -1.2572, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, -1.2572, -1.2572, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954],
-    4: [0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819],
-    5: [-1.078, -1.078, -1.078, -1.078, -1.078, -1.078, -1.078, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, -1.078, -1.078, -1.078, 0.9276, 0.9276, -1.078, -1.078, -1.078, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, -1.078, -1.078, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, -1.078, -1.078, -1.078, -1.078, 0.9276, 0.9276],
-    6: [0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753],
-    7: [-1.4412, -1.4412, -1.4412, -1.4412, -1.4412, -1.4412, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939],
-    8: [1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0],
-    9: [0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753],
+# 验证码 0-9 字形模板(站点固定字体, bbox 裁剪后逐行 '.#' 串, 与模板做最小汉明距离匹配)
+_CAPTCHA_TPL = {
+    "0": [
+        "...##",
+        "..####",
+        ".##..##",
+        "##....##",
+        "##....##",
+        "##....##",
+        "##....##",
+        ".##..##",
+        "..####",
+        "...##",
+    ],
+    "1": [
+        "..##",
+        ".###",
+        "####",
+        "..##",
+        "..##",
+        "..##",
+        "..##",
+        "..##",
+        "..##",
+        "######",
+    ],
+    "2": [
+        "..####",
+        ".##..##",
+        "##....##",
+        "......##",
+        ".....##",
+        "....##",
+        "...##",
+        "..##",
+        ".##",
+        "########",
+    ],
+    "3": [
+        ".#####",
+        "##...##",
+        "......##",
+        ".....##",
+        "...###",
+        ".....##",
+        "......##",
+        "......##",
+        "##...##",
+        ".#####",
+    ],
+    "4": [
+        ".....##",
+        "....###",
+        "...####",
+        "..##.##",
+        ".##..##",
+        "##...##",
+        "########",
+        ".....##",
+        ".....##",
+        ".....##",
+    ],
+    "5": [
+        "#######",
+        "##",
+        "##",
+        "##.###",
+        "###..##",
+        "......##",
+        "......##",
+        "##....##",
+        ".##..##",
+        "..####",
+    ],
+    "6": [
+        "..####",
+        ".##..##",
+        "##....#",
+        "##",
+        "##.###",
+        "###..##",
+        "##....##",
+        "##....##",
+        ".##..##",
+        "..####",
+    ],
+    "7": [
+        "########",
+        "......##",
+        "......##",
+        ".....##",
+        "....##",
+        "...##",
+        "..##",
+        ".##",
+        "##",
+        "##",
+    ],
+    "8": [
+        "..####",
+        ".##..##",
+        "##....##",
+        ".##..##",
+        "..####",
+        ".##..##",
+        "##....##",
+        "##....##",
+        ".##..##",
+        "..####",
+    ],
+    "9": [
+        "..####",
+        ".##..##",
+        "##....##",
+        "##....##",
+        ".##..###",
+        "..###.##",
+        "......##",
+        ".#....##",
+        ".##..##",
+        "..####",
+    ],
 }
-PARSE_MAP = {'JD': "https://fgsrg.hzqingshan.com", 'co': "https://zzrs.mfdyvip.com", 'knmb': "https://zzrs.mfdyvip.com", 'YYNB': "https://zzrs.mfdyvip.com"}
 
-def _decode_png(data):
-    if data[:8] != b'\x89PNG\r\n\x1a\n': raise ValueError('not png')
-    pos, width, height, idat = 8, None, None, b''
-    while pos < len(data):
-        ln, typ, chunk = struct.unpack('>I', data[pos:pos+4])[0], data[pos+4:pos+8], data[pos+8:pos+8+struct.unpack('>I', data[pos:pos+4])[0]]
-        pos += 12 + ln
-        if typ == b'IHDR': width, height, bit_depth, color_type = struct.unpack('>IIBB', chunk[:10])
-        elif typ == b'IDAT': idat += chunk
-        elif typ == b'IEND': break
-    if color_type not in (0, 2, 3, 4, 6): raise ValueError('color type')
-    channels, stride, raw = {0:1, 2:3, 3:1, 4:2, 6:4}[color_type], width * {0:1, 2:3, 3:1, 4:2, 6:4}[color_type], zlib.decompress(idat)
-    prev, gray, p = bytearray(stride), [], 0
-    for y in range(height):
-        ft, line, p = raw[p], bytearray(raw[p+1:p+1+stride]), p + 1 + stride
-        if ft == 1:
-            for i in range(channels, stride): line[i] = (line[i] + line[i-channels]) & 0xff
-        elif ft == 2:
-            for i in range(stride): line[i] = (line[i] + prev[i]) & 0xff
-        elif ft == 3:
-            for i in range(stride): line[i] = (line[i] + (((line[i-channels] if i >= channels else 0) + prev[i]) >> 1)) & 0xff
-        elif ft == 4:
-            for i in range(stride):
-                a, b, c = line[i-channels] if i >= channels else 0, prev[i], prev[i-channels] if i >= channels else 0
-                pp = a + b - c; pa, pb, pc = abs(pp-a), abs(pp-b), abs(pp-c)
-                line[i] = (line[i] + (a if (pa <= pb and pa <= pc) else (b if pb <= pc else c))) & 0xff
-        if color_type in (2, 6): step = 3 if color_type == 2 else 4; rows = [int(line[x*step]*0.299 + line[x*step+1]*0.587 + line[x*step+2]*0.114) for x in range(width)]
-        elif color_type == 4: rows = [line[x*2] for x in range(width)]
-        else: rows = list(line[:width])
-        gray.append(rows); prev = line
-    return width, height, gray
-
-def _cap_resize(block, tw=8, th=10):
-    bh, bw = len(block), len(block[0])
-    flat = []
-    for ty in range(th):
-        yf = ty * (bh - 1) / (th - 1)
-        y0 = int(yf); y1 = min(y0 + 1, bh - 1); fy = yf - y0
-        for tx in range(tw):
-            xf = tx * (bw - 1) / (tw - 1)
-            x0 = int(xf); x1 = min(x0 + 1, bw - 1); fx = xf - x0
-            v = (block[y0][x0] * (1 - fx) + block[y0][x1] * fx) * (1 - fy) + (block[y1][x0] * (1 - fx) + block[y1][x1] * fx) * fy
-            flat.append(v)
-    return flat
-
-
-def _cap_norm(vals):
-    n = len(vals)
-    m = sum(vals) / n
-    var = sum((v - m) ** 2 for v in vals) / n
-    sd = var ** 0.5 if var > 0 else 1.0
-    return [(v - m) / sd for v in vals]
-
-
-def _recognize_captcha(data):
-    """识别 4 位数字验证码：
-    - 纯 Python PNG 解码（_decode_png）
-    - 自适应阈值二值化 → 列投影切 4 段
-    - 每字符灰度块双线性缩放 8x10 → 零均值单位方差归一化
-    - 与 CAP_TPL（按真实验证码样本训练的归一化模板）做余弦相关取 argmax
-    - 任一字符置信度 < 0.85 判为失败（返回 None，由调用方换图重试）
-    模板于 2026-10 针对 maihaolian.com/zzztool.com 现行验证码字体重新拟合。
-    """
-    try:
-        W, H, gray = _decode_png(data)
-    except Exception:
-        return None
-    avg = sum(sum(r) for r in gray) / (W * H) if W * H else 128
-    thr = min(max(avg * 0.8, 80), 170)
-    bw = [[1 if gray[y][x] < thr else 0 for x in range(W)] for y in range(H)]
-    col_sums = [sum(bw[y][x] for y in range(H)) for x in range(W)]
-    segs, inseg, start = [], False, 0
-    for x in range(W):
-        if col_sums[x] > 0 and not inseg:
-            start, inseg = x, True
-        elif col_sums[x] == 0 and inseg:
-            if x - start >= 3:
-                segs.append((start, x - 1))
-            inseg = False
-    if inseg and (W - start >= 3):
-        segs.append((start, W - 1))
-    if len(segs) != 4:
-        return None
-    result = ''
-    for s, e in segs:
-        rows = [y for y in range(H) if any(gray[y][x] < thr for x in range(s, e + 1))]
-        if not rows:
-            return None
-        block = [[gray[y][x] for x in range(s, e + 1)] for y in range(rows[0], rows[-1] + 1)]
-        vec = _cap_norm(_cap_resize(block))
-        best_d, best_s = None, -1e9
-        for d in range(10):
-            sc = sum(a * b for a, b in zip(vec, CAP_TPL[d])) / len(vec)
-            if sc > best_s:
-                best_d, best_s = d, sc
-        if best_s < 0.85:
-            return None
-        result += str(best_d)
-    return result
-
-def _make_options(arr): return [{"n": "全部", "v": ""}] + [{"n": str(x), "v": str(x)} for x in arr]
-def _get_year_filter(): return {"key": "year", "name": "年份", "value": _make_options(list(range(datetime.datetime.now().year, datetime.datetime.now().year - 23, -1)))}
-def _get_letter_filter(): return {"key": "letter", "name": "字母", "value": _make_options([chr(65 + i) for i in range(26)] + ["0-9"])}
-def _get_order_by_filter(): return {"key": "orderby", "name": "默认排序", "value": [{"n": "默认排序", "v": ""}, {"n": "人气", "v": "hits"}, {"n": "时间", "v": "time"}, {"n": "评分", "v": "score"}]}
-
-_OTHER_FILTERS = [{"key": "area", "name": "地区", "value": _make_options(["大陆", "香港", "台湾", "美国", "韩国", "日本", "泰国", "新加坡", "马来西亚", "印度", "英国", "法国", "加拿大", "西班牙", "俄罗斯", "其它"])}, _get_year_filter(), {"key": "lang", "name": "语言", "value": _make_options(["国语", "英语", "粤语", "闽南语", "韩语", "日语", "其它"])}, _get_letter_filter(), _get_order_by_filter()]
-MY_FILTERS = {
-    "1": [{"key": "type", "name": "类型", "value": [{"n": "全部", "v": "1"}, {"n": "动作片", "v": "6"}, {"n": "喜剧片", "v": "7"}, {"n": "恐怖片", "v": "8"}, {"n": "科幻片", "v": "9"}, {"n": "爱情片", "v": "10"}, {"n": "剧情片", "v": "11"}]}, {"key": "class", "name": "剧情", "value": _make_options(["喜剧", "爱情", "恐怖", "动作", "科幻", "剧情", "战争", "警匪", "犯罪", "动画", "奇幻", "武侠", "冒险", "枪战", "悬疑", "惊悚", "经典", "青春", "文艺", "微电影", "古装", "历史", "运动", "农村", "儿童", "网络电影"])}] + _OTHER_FILTERS,
-    "2": [{"key": "type", "name": "类型", "value": [{"n": "全部", "v": "2"}, {"n": "国产剧", "v": "13"}, {"n": "日韩剧", "v": "15"}, {"n": "海外剧", "v": "16"}]}, {"key": "class", "name": "剧情", "value": _make_options(["古装", "战争", "青春偶像", "喜剧", "家庭", "犯罪", "动作", "奇幻", "剧情", "历史", "经典", "乡村", "情景", "商战", "网剧", "其他"])}] + _OTHER_FILTERS,
-    "3": [{"key": "type", "name": "类型", "value": [{"n": "全部", "v": "3"}, {"n": "大陆综艺", "v": "21"}, {"n": "日韩综艺", "v": "22"}]}, {"key": "class", "name": "剧情", "value": _make_options(["选秀", "情感", "访谈", "播报", "旅游", "音乐", "美食", "纪实", "曲艺", "生活", "游戏互动", "财经", "求职"])}] + _OTHER_FILTERS,
-    "4": [{"key": "type", "name": "类型", "value": [{"n": "全部", "v": "4"}, {"n": "国产动漫", "v": "25"}, {"n": "日韩动漫", "v": "26"}]}, {"key": "class", "name": "剧情", "value": _make_options(["情感", "科幻", "热血", "推理", "搞笑", "冒险", "萝莉", "校园", "动作", "机战", "运动", "战争", "少年", "少女", "社会", "原创", "亲子", "益智", "励志", "其他"])}] + _OTHER_FILTERS,
-    "5": [_get_year_filter(), _get_letter_filter()]
-}
 
 class Spider(BaseSpider):
-    def getName(self): return "枫叶4K影院"
+    publish_url = "https://www.vip1949.com/"
+    default_sites = [
+        "https://www.zzztool.com",
+        "https://maihaolian.com",
+        "https://www.cd-zj.com",
+    ]
+    base_url = default_sites[0]
+    # verify_success 越过列表页的"系统安全验证", site_entry 越过播放页的继续播放确认
+    cookie = "verify_success=1; site_entry=1"
+    debug = False
+    timeout = 15
 
-    def init(self, extend=""):
-        global SITE, SITES, HDRS
-        self.log("[init] 初始化开始"); self.sess = requests.Session(); self.sess.headers.update(HDRS)
-        if isinstance(extend, str) and extend:
+    # 播放源(player_aaaa.from) -> 解析服务域名 的人工覆盖表
+    # 正常取值来自站点 player_list, 这里只放用户在 extend 里显式指定的内容
+    parse_map = {}
+
+    # 站点 /static/js/playerconfig.js 里的 player_list 权威副本
+    # ps=1 走二次解析(ps 字段含义: 1=需解析 0=直连), parse 为解析前缀
+    default_player_list = {
+        'JD2K':     {'show': '蓝光2k', 'ps': '1', 'parse': 'https://fgsrg.hzqingshan.com/player/?url='},
+        'co':       {'show': '蓝光2k', 'ps': '1', 'parse': 'https://zsmyyrv.hzqingshan.com/player/?url='},
+        'BBA':      {'show': '蓝光2k', 'ps': '1', 'parse': 'https://zsmyyrv.hzqingshan.com/player/?url='},
+        'vwnet':    {'show': '蓝光2k', 'ps': '1', 'parse': 'https://zsmyyrv.hzqingshan.com/player/?url='},
+        'YYNB':     {'show': '蓝光2k', 'ps': '1', 'parse': 'https://zsmyyrv.hzqingshan.com/player/?url='},
+        'JD4K':     {'show': '至臻4k', 'ps': '1', 'parse': 'https://fgsrg.hzqingshan.com/player/?url='},
+        'qiyi':     {'show': '爱奇艺', 'ps': '1', 'parse': 'https://zzrs.mfdyvip.com/player/?url='},
+        'bilibili': {'show': 'B站',    'ps': '1', 'parse': 'https://zzrs.mfdyvip.com/player/?url='},
+        'qq':       {'show': '腾讯',   'ps': '1', 'parse': 'https://zzrs.mfdyvip.com/player/?url='},
+        'youku':    {'show': '优酷',   'ps': '1', 'parse': 'https://zzrs.mfdyvip.com/player/?url='},
+        'dyttm3u8': {'show': '自营t',  'ps': '0', 'parse': ''},
+        '1080zy':   {'show': '自营y',  'ps': '0', 'parse': ''},
+        '1080zyk':  {'show': '自营y',  'ps': '0', 'parse': ''},
+        'rym3u8':   {'show': '自营r',  'ps': '0', 'parse': ''},
+        'ruyi':     {'show': '自营r',  'ps': '0', 'parse': ''},
+    }
+
+    # 全部已知的解析服务域名, 某个域名超时/失效时按顺序换用
+    parse_pool = [
+        'https://zsmyyrv.hzqingshan.com',
+        'https://fgsrg.hzqingshan.com',
+        'https://zzrs.mfdyvip.com',
+    ]
+
+    # 解析服务常有连接超时, 单次等待过长会让播放器先报播放超时
+    parse_timeout = 8   # 单域名单次请求超时(秒)
+    parse_retries = 2   # 单域名重试次数
+
+    # 已确认失效的解析服务域名, 连续失败若干次后暂时跳过
+    _parse_bad = {}
+    PARSE_BAD_TTL = 900  # 15 分钟
+
+    # 详情页的集数->线路映射, 供某条线路不可用时回落到同一集的其它线路
+    _ep_map = {}
+
+    # 回落链深度, 防止多条线路互相递归调用
+    _alt_depth = 0
+
+    # 动态 host 缓存
+    _cache_host = ""
+    _cache_time = 0
+    CACHE_DURATION = 300  # 5 分钟
+
+    # player_list 缓存(按 host 分别缓存)
+    _cache_plist = {}
+    _cache_plist_time = 0
+    PLIST_DURATION = 1800  # 30 分钟
+
+    # ----------------------------------------------------------
+    # 基础请求
+    # ----------------------------------------------------------
+    def _log(self, *args):
+        if self.debug:
+            print("[maple]", *args)
+
+    def _headers(self, referer=None):
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 Chrome/150.0.0.0 Mobile",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        if referer is None:
+            headers["Referer"] = self.base_url + "/"
+        elif referer:
+            headers["Referer"] = referer
+        if self.cookie:
+            headers["Cookie"] = self.cookie
+        return headers
+
+    def _session(self):
+        """持久会话: 系统安全验证的通过状态绑定 PHPSESSID,
+        必须用同一个 Session 连续完成 拉验证码 -> 提交 -> 再搜索。
+        不能带静态 Cookie(verify_success=1 等), 实测它会干扰
+        /captcha.php?type=verify 的会话校验, 导致验证码永远提交失败。
+        """
+        if getattr(self, '_sess', None) is None:
+            self._sess = requests.Session()
+            h = self._headers()
+            h.pop("Cookie", None)
+            self._sess.headers.update(h)
+        return self._sess
+
+    def _captcha_ocr(self, img_bytes):
+        """验证码识别: 站点为固定字体的 4 位数字 PNG(100x40, 无干扰线)。
+        纯标准库解码像素 -> 按列空隙分割 -> 与内置 0-9 字形模板做最小汉明距离匹配。
+        实测 20/20 与 tesseract 一致、真实提交 5/5 通过, 不依赖任何 OCR 库。
+        """
+        try:
+            pos = 8; idat = b''; w = h = 0; color = 2
+            while pos + 8 <= len(img_bytes):
+                ln = struct.unpack('>I', img_bytes[pos:pos+4])[0]
+                ctype = img_bytes[pos+4:pos+8]
+                if ctype == b'IHDR':
+                    w, h, depth, color = struct.unpack('>IIBB', img_bytes[pos+8:pos+18])
+                elif ctype == b'IDAT':
+                    idat += img_bytes[pos+8:pos+8+ln]
+                pos += 12 + ln
+            if not (idat and w and h):
+                return ''
+            raw = zlib.decompress(idat)
+            bpp = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color)
+            if bpp is None:
+                return ''
+            stride = w * bpp
+            rows = []; prev = bytearray(stride); p = 0
+            for _y in range(h):
+                f = raw[p]; p += 1
+                line = bytearray(raw[p:p+stride]); p += stride
+                if f == 1:
+                    for i in range(bpp, stride): line[i] = (line[i] + line[i-bpp]) & 0xFF
+                elif f == 2:
+                    for i in range(stride): line[i] = (line[i] + prev[i]) & 0xFF
+                elif f == 3:
+                    for i in range(stride):
+                        line[i] = (line[i] + ((line[i-bpp] if i >= bpp else 0) + prev[i]) // 2) & 0xFF
+                elif f == 4:
+                    for i in range(stride):
+                        a = line[i-bpp] if i >= bpp else 0
+                        b = prev[i]; c = prev[i-bpp] if i >= bpp else 0
+                        pp_ = a + b - c
+                        pa, pb, pc = abs(pp_-a), abs(pp_-b), abs(pp_-c)
+                        pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                        line[i] = (line[i] + pr) & 0xFF
+                rows.append(bytes(line)); prev = line
+            grid = [''.join('#' if (row[x*bpp] + row[x*bpp+1] + row[x*bpp+2]) // 3 < 128 else '.'
+                            for x in range(w)) for row in rows]
+        except Exception as e:
+            self._log('验证码解码失败', e)
+            return ''
+        digits = ''
+        cols = [any(grid[y][x] == '#' for y in range(12, min(28, h))) for x in range(w)]
+        x = 0
+        while x < w:
+            if not cols[x]:
+                x += 1
+                continue
+            x0 = x
+            while x < w and cols[x]:
+                x += 1
+            cand = [grid[y][x0:x] for y in range(12, min(28, h))]
+            while cand and not cand[0].strip('.'): cand.pop(0)
+            while cand and not cand[-1].strip('.'): cand.pop()
+            if not cand:
+                continue
+            cw = max(len(r) for r in cand)
+            best, bd = '', 9999
+            for d, tpl in _CAPTCHA_TPL.items():
+                tw = max(cw, max(len(r) for r in tpl))
+                dist = sum(sum(1 for ca, cb in zip(
+                    (cand[i] if i < len(cand) else '').ljust(tw, '.'),
+                    tpl[i].ljust(tw, '.')) if ca != cb)
+                    for i in range(max(len(cand), len(tpl))))
+                if dist < bd:
+                    bd, best = dist, d
+            digits += best
+        return digits if len(digits) == 4 else ''
+
+    def _pass_captcha(self):
+        """搜索页触发"系统安全验证"时走 /captcha.php 流程:
+        拉图 -> 识别 -> 提交 -> 成功后同一 Session 内搜索页即恢复。"""
+        sess = self._session()
+        for _attempt in range(3):
             try:
-                ext_dict = json.loads(extend)
-                if isinstance(ext_dict, dict) and ext_dict.get('sites'):
-                    SITES, idx = ext_dict['sites'], int(ext_dict.get('sitesIndex', 0))
-                    SITE = SITES[idx if 0 <= idx < len(SITES) else 0]; HDRS["Referer"] = SITE + "/"
-            except Exception: pass
-        cached_cookie = self.getCache("cd_zj_cookie")
-        if cached_cookie:
-            for item in str(cached_cookie).split(";"):
-                if "=" in item:
-                    k, v = item.strip().split("=", 1)
-                    if k.strip() and v.strip(): self.sess.cookies.set(k.strip(), v.strip())
-        try:
-            r = self.sess.get(SITE + "/", headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            if "系统安全验证" in r.text: self._auto_verify()
-        except Exception as e: self.log(f"[init] 初始化请求异常: {e}")
-
-    def _check_and_refresh(self, resp_text): return self._auto_verify() if "系统安全验证" in resp_text else False
-
-    def _verify_once(self):
-        try:
-            cap = self.sess.get(SITE + "/captcha.php?type=code&r=0.12345", headers={"User-Agent": UA, "Referer": SITE + "/"}, timeout=20).content
-            code = _recognize_captcha(cap)
-            if not code: return False
-            resp = self.sess.post(SITE + "/captcha.php?type=verify", data={"check": code}, headers={"User-Agent": UA, "Referer": SITE + "/", "Content-Type": "application/x-www-form-urlencoded"}, timeout=20)
-            resp.encoding = 'utf-8'
-            try: return resp.json().get("code") == 1
-            except Exception: return '"code":1' in resp.text
-        except Exception: return False
-
-    def _auto_verify(self):
-        for _ in range(5):
-            if self._verify_once():
-                time.sleep(1)
-                try:
-                    r2 = self.sess.get(SITE + "/", headers=HDRS, timeout=20); r2.encoding = 'utf-8'
-                    if "系统安全验证" not in r2.text:
-                        mac_v, ver_s = self.sess.cookies.get("mac_verify", ""), self.sess.cookies.get("verify_success", "1")
-                        if mac_v: self.setCache("cd_zj_cookie", f"mac_verify={mac_v};verify_success={ver_s};")
-                        return True
-                except Exception: return True
-            time.sleep(1.5)
+                img = sess.get('%s/captcha.php?type=code&r=%f' % (self.base_url, time.time()),
+                               timeout=self.timeout).content
+                code = self._captcha_ocr(img)
+                self._log('验证码识别:', code or '失败, 重试')
+                if not code:
+                    continue
+                r = sess.post('%s/captcha.php?type=verify' % self.base_url,
+                              data={'check': code},
+                              headers={'X-Requested-With': 'XMLHttpRequest'},
+                              timeout=self.timeout)
+                res = {}
+                if r.text:
+                    try:
+                        res = r.json()
+                    except Exception:
+                        res = {}
+                if res.get('code') == 1:
+                    self._log('系统安全验证通过')
+                    return True
+            except Exception as e:
+                self._log('过验证码异常:', e)
         return False
 
-    def homeContent(self, filter):
-        return {"parse": 0, "jx": 0, "class": [{"type_id": "4", "type_name": "动漫"}, {"type_id": "/label/qq", "type_name": "腾讯精选"}, {"type_id": "/label/bli", "type_name": "B站精选"}, {"type_id": "/label/youku", "type_name": "优酷精选"}, {"type_id": "2", "type_name": "电视剧"}, {"type_id": "1", "type_name": "电影"}, {"type_id": "3", "type_name": "综艺"}, {"type_id": "5", "type_name": "热门短剧"}], "filters": MY_FILTERS}
+    def _fetch(self, url, referer=None, retries=3, timeout=None):
+        """请求 HTML(相对路径自动拼接 base_url), 失败返回 ''
+        站点对同 IP 高频请求会间歇性断连, 这里做有限次重试。
+        使用持久 Session 保持验证码会话连续性, 且不带静态 Cookie。
+        """
+        if not url.startswith('http'):
+            url = self.base_url + url
+        timeout = timeout or self.timeout
+        for attempt in range(retries):
+            try:
+                h = self._headers(referer)
+                h.pop("Cookie", None)
+                r = self._session().get(url, headers=h, timeout=timeout)
+                r.encoding = r.apparent_encoding or 'utf-8'
+                if r.status_code == 200:
+                    return r.text
+                self._log('请求失败', r.status_code, url)
+            except Exception as e:
+                self._log('请求异常', url, e)
+            if attempt + 1 < retries:
+                time.sleep(0.6)
+        return ''
 
-    def homeVideoContent(self): return self.categoryContent("", 1, False, {})
-
-    def categoryContent(self, tid, pg, filter, extend):
-        self.log(f"[categoryContent] tid: {tid}, pg: {pg}, extend: {extend}")
-        page = int(pg) if str(pg).isdigit() else 1
-        if not isinstance(extend, dict): extend = {}
-        is_label = tid.startswith("/label")
-        target_type = extend.get("type") if extend.get("type") is not None else tid
-        type_prefix = "cupfox-list" if ("www.cd-zj.com" in SITE or "maihaolian.com" in SITE) else "list"
-        area, orderby, clazz, lang, letter, year = extend.get("area", ""), extend.get("orderby", "time"), extend.get("class", ""), extend.get("lang", ""), extend.get("letter", ""), extend.get("year", "")
-        url = f"{SITE}{tid}/page/{page}.html" if is_label else (SITE if target_type == "" else f"{SITE}/{type_prefix}/{target_type}-{area}-{orderby}-{clazz}-{lang}-{letter}---{page}---{year}.html")
-
+    def _fetch_json(self, url, referer=None):
+        """请求 JSON 接口并解析为 dict, 失败返回 {}"""
         try:
-            r = self.sess.get(url, headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            if self._check_and_refresh(r.text): r = self.sess.get(url, headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            if "系统安全验证" not in r.text:
-                vods, totalpg = self._parseListHtml(r.text, 'zzz' in SITE, is_label, False)
-                return {"parse": 0, "jx": 0, "list": vods, "page": page, "pagecount": totalpg, "limit": 30, "total": totalpg * 30}
-        except Exception as e: self.log(f"[categoryContent] 异常: {e}")
-        return {"parse": 0, "jx": 0, "list": [], "page": page, "pagecount": 1}
+            text = self._fetch(url, referer)
+            if not text:
+                return {}
+            return json.loads(text)
+        except Exception as e:
+            self._log('_fetch_json异常', e)
+            return {}
 
-    def _parseListHtml(self, html_content, is_zzz, is_label=False, is_search=False):
-        if "系统安全验证" in html_content: self.log("需要验证，请重新获取ck"); raise Exception('需要验证，请重新获取ck')
-        soup, vods = BeautifulSoup(html_content, BS_PARSER), []
-        for el in soup.select(".module-item" if is_zzz else ".public-list-bj"):
-            if is_zzz:
-                poster = el.select_one('.module-card-item-poster') if (is_label or is_search) else None
-                vod_id = poster.get("href") if poster else el.get("href", "")
-                title_tag = el.select_one('.module-card-item-title strong') if is_label else None
-                vod_name = title_tag.get_text(strip=True) if title_tag else el.get("title", "")
-                pic_tag, note_tag = el.select_one(".module-item-pic img"), el.select_one(".module-item-note")
-                vod_pic = pic_tag.get("data-src") or pic_tag.get("src") if pic_tag else ""
-                vod_remarks = note_tag.get_text(strip=True) if note_tag else ""
-                v_left, v_right = el.select_one('.module-item-version-left'), el.select_one('.module-item-version-right')
-                text4k, update_time = v_left.get_text(strip=True) if v_left else "", v_right.get_text(strip=True) if v_right else ""
-            else:
-                exp_tag = el.select_one("a.public-list-exp")
-                vod_id, vod_name = exp_tag.get("href") if exp_tag else "", exp_tag.get("title") if exp_tag else ""
-                if not vod_name:
-                    thumb = soup.select_one(".thumb-content a"); vod_name = thumb.get_text(strip=True) if thumb else ""
-                pic_tag, ft2_tag = el.select_one(".public-list-exp img"), el.select_one(".ft2")
-                vod_pic = pic_tag.get("data-src") or pic_tag.get("src") if pic_tag else ""
-                vod_remarks = ft2_tag.get_text(strip=True) if ft2_tag else ""
-                prt_g, prt_all = el.select_one('.public-list-exp .public-prt-g'), el.select('.public-list-exp .public-prt')
-                text4k, update_time = prt_g.get_text(strip=True) if prt_g else "", prt_all[1].get_text(strip=True) if len(prt_all) > 1 else ""
+    def _fix_pic(self, u):
+        if not u:
+            return ''
+        if u.startswith('//'):
+            return 'https:' + u
+        return u.replace('&amp;', '&')
 
-            if vod_id: vods.append({"vod_id": vod_id, "vod_name": (vod_name or "").strip(), "vod_pic": html.unescape(vod_pic) if vod_pic else "", "vod_remarks": vod_remarks, "vod_year": f"{f'「{text4k}」' if text4k else ''} {update_time}".strip()})
+    @staticmethod
+    def _parse_extend(extend):
+        """兼容 dict / JSON 字符串 / key=val&... / ; / | 管道多种格式"""
+        if not extend:
+            return {}
+        if isinstance(extend, dict):
+            return extend
+        s = str(extend).strip()
+        if '%' in s:
+            # 兼容 URL 编码字符串(电报/订阅分享格式)
+            try:
+                s = urllib.parse.unquote(s)
+            except Exception:
+                pass
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+        if '=' in s:
+            d = {}
+            # 兼容单组 key=value 或 key1=val1&key2=val2 等多组
+            sep = '&' if '&' in s else (';' if ';' in s else None)
+            parts = s.split(sep) if sep else [s]
+            for part in parts:
+                if '=' in part:
+                    k, v = part.split('=', 1)
+                    d[k.strip()] = v.strip()
+            if d:
+                return d
+        if '|' in s:
+            keys = ['type', 'area', 'class', 'lang', 'letter', 'orderBy', 'year']
+            return {keys[i]: v.strip() for i, v in enumerate(s.split('|')) if i < len(keys)}
+        return {}
 
-        pagecount = 1
-        if is_zzz:
-            page_next = soup.select('.module-footer .page-next')
-            if page_next and (m := RE_PAGE_NEXT.search(page_next[-1].get('href', ''))): pagecount = int(m.group(0))
+    # ----------------------------------------------------------
+    # 动态 host 获取(发布页)
+    # ----------------------------------------------------------
+    def check_url_online(self, url, timeout=3):
+        try:
+            r = requests.get(url, headers=self._headers(), timeout=timeout, allow_redirects=True)
+            return 200 <= r.status_code < 400
+        except Exception:
+            return False
+
+    def get_online_host(self, publish_url=None):
+        publish_url = publish_url or self.publish_url
+        try:
+            r = requests.get(publish_url, headers=self._headers(), timeout=self.timeout)
+            r.raise_for_status()
+            html = r.content.decode('utf-8', 'ignore')
+        except Exception as e:
+            self._log('获取发布页异常', e)
+            return self.default_sites[0]
+        m = re.search(r'const\s+domains\s*=\s*(\[.*?\]);', html, re.S)
+        if not m:
+            self._log('发布页未找到 domains, 使用默认站点')
+            return self.default_sites[0]
+        js = m.group(1)
+        # 修复 JS 裸键为标准 JSON(只给 { 或 , 后的裸键加引号, 避免误伤 https:)
+        js = re.sub(r'([{,]\s*)(\w+)\s*:', r'\1"\2":', js)
+        try:
+            domains = json.loads(js)
+        except Exception as e:
+            self._log('domains JSON 解析失败', e)
+            return self.default_sites[0]
+        for item in domains:
+            url = (item.get('url') or '').rstrip('/')
+            if url and self.check_url_online(url):
+                return url
+        return self.default_sites[0]
+
+    # ----------------------------------------------------------
+    # 生命周期
+    # ----------------------------------------------------------
+    def init(self, extend=""):
+        ext = self._parse_extend(extend)
+
+        if isinstance(ext.get('parse_map'), dict) and ext['parse_map']:
+            self.parse_map.update(ext['parse_map'])
+        if isinstance(ext.get('default_sites'), list) and ext['default_sites']:
+            self.default_sites = ext['default_sites']
+        if ext.get('publish_url'):
+            self.publish_url = ext['publish_url']
+
+        # Cookie / fyck 文件
+        if ext.get('cookie'):
+            self.cookie = ext['cookie']
+        elif ext.get('fyck'):
+            path = ext['fyck']
+            if not os.path.isabs(path):
+                path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    self.cookie = f.read().strip()
+                self._log('已读取 Cookie 文件, 长度', len(self.cookie))
+            except Exception as e:
+                self._log('读取 Cookie 文件失败', e)
+                self.cookie = ''
+        if not self.cookie:
+            self.cookie = "verify_success=1; site_entry=1"
+
+        self.debug = bool(ext.get('debug', False))
+
+        # 确定 base_url: host > sites/sitesIndex > 缓存 > 发布页 > 默认
+        if ext.get('host'):
+            self.base_url = str(ext['host']).rstrip('/')
+        elif ext.get('sites') and isinstance(ext['sites'], list) and ext['sites']:
+            self.default_sites = ext['sites']
+            idx = int(ext.get('sitesIndex', 0) or 0)
+            if idx < 0 or idx >= len(self.default_sites):
+                idx = 0
+            self.base_url = self.default_sites[idx]
         else:
-            page_tip = soup.select_one('.page-tip')
-            if page_tip and (m := RE_PAGE_TIP.search(page_tip.get_text())): pagecount = int(m.group(1))
-        return vods, pagecount
+            now = time.time()
+            if self._cache_host and now - self._cache_time < self.CACHE_DURATION:
+                self.base_url = self._cache_host
+            else:
+                host = self.get_online_host(self.publish_url)
+                if host:
+                    self.base_url = host
+                    self._cache_host = host
+                    self._cache_time = now
+        self._log('最终 base_url:', self.base_url)
 
-    def _buildVodPlayData(self, lines, playlists, should_reverse=True):
+    def getName(self):
+        return '枫叶影院'
+
+    # ----------------------------------------------------------
+    # 首页 + 筛选器
+    # ----------------------------------------------------------
+    def homeContent(self, filter):
         return {
-            "vod_play_from": "$$$".join(filter(None, [f"{line}({len(eps)})" for line, eps in zip(lines, playlists)])),
-            "vod_play_url": "$$$".join(["#".join(reversed(eps) if should_reverse else eps) for eps in playlists])
+            "class": [
+                {'type_id': "/label/qq", 'type_name': "腾讯VIP精选"},
+                {'type_id': "/label/bli", 'type_name': "B站VIP精选"},
+                {'type_id': "/label/youku", 'type_name': "优酷VIP精选"},
+                {"type_id": "2", "type_name": "电视剧"},
+                {"type_id": "1", "type_name": "电影"},
+                {"type_id": "4", "type_name": "动漫"},
+                {"type_id": "3", "type_name": "综艺"},
+                {"type_id": "5", "type_name": "热门短剧"},
+            ],
+            "filters": self._build_filters()
         }
 
-    def _extractPlayInfo(self, soup, tab_sel, label_sel, panel_sel, item_sel):
-        lines, playlists, name_counts = [], [], {}
-        for tab in soup.select(tab_sel):
-            lbl = tab.select_one(label_sel); raw_name = lbl.get_text(strip=True) if lbl else "线路"
-            if raw_name:
-                name_counts[raw_name] = name_counts.get(raw_name, 0) + 1
-                lines.append(f"{raw_name}-{name_counts[raw_name]}" if name_counts[raw_name] > 1 else raw_name)
-        for panel in soup.select(panel_sel):
-            playlists.append([f"{a_el.get_text(strip=True)}${a_el.get('href', '')}" for a_el in panel.select(item_sel) if a_el.get_text(strip=True) and a_el.get('href')])
-        return self._buildVodPlayData(lines, playlists, True)
+    def homeVideoContent(self):
+        html = self._fetch('/')
+        return {"list": self._parse_video_list(html) if html else []}
 
-    def detailContent(self, ids):
-        vid = str(ids[0] if isinstance(ids, (list, tuple)) else ids)
-        url = vid if vid.startswith("http") else SITE + (vid if vid.startswith("/") else "/" + vid)
+    def _build_filters(self):
+        area = [{"n": "全部", "v": ""}, {"n": "大陆", "v": "大陆"}, {"n": "香港", "v": "香港"},
+                {"n": "台湾", "v": "台湾"}, {"n": "美国", "v": "美国"}, {"n": "韩国", "v": "韩国"},
+                {"n": "日本", "v": "日本"}, {"n": "泰国", "v": "泰国"}, {"n": "新加坡", "v": "新加坡"},
+                {"n": "马来西亚", "v": "马来西亚"}, {"n": "印度", "v": "印度"}, {"n": "英国", "v": "英国"},
+                {"n": "法国", "v": "法国"}, {"n": "加拿大", "v": "加拿大"}, {"n": "西班牙", "v": "西班牙"},
+                {"n": "俄罗斯", "v": "俄罗斯"}, {"n": "其它", "v": "其它"}]
+        cur = datetime.now().year
+        years = [{"n": "全部", "v": ""}] + [{"n": str(y), "v": str(y)} for y in range(cur, cur - 23, -1)]
+        lang = [{"n": "全部", "v": ""}, {"n": "国语", "v": "国语"}, {"n": "英语", "v": "英语"},
+                {"n": "粤语", "v": "粤语"}, {"n": "闽南语", "v": "闽南语"}, {"n": "韩语", "v": "韩语"},
+                {"n": "日语", "v": "日语"}, {"n": "法语", "v": "法语"}, {"n": "德语", "v": "德语"},
+                {"n": "其它", "v": "其它"}]
+        sort = [{"n": "时间", "v": "time"}, {"n": "人气", "v": "hits"}, {"n": "评分", "v": "score"}]
+        letter = [{"n": "全部", "v": ""}] + [{"n": c, "v": c} for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"] \
+            + [{"n": "0-9", "v": "0-9"}]
+
+        def opts(pairs):
+            return [{"n": k, "v": v} for k, v in pairs]
+
+        return {
+            "2": [
+                {"key": "class", "name": "类型", "value": [
+                    {"n": "全部", "v": "2"}, {"n": "国产剧", "v": "13"}, {"n": "日韩剧", "v": "15"},
+                    {"n": "海外剧", "v": "16"}]},
+                {"key": "area", "name": "地区", "value": area},
+                {"key": "genre", "name": "剧情", "value": opts([
+                    ("全部", ""), ("古装", "古装"), ("战争", "战争"), ("青春偶像", "青春偶像"),
+                    ("喜剧", "喜剧"), ("家庭", "家庭"), ("犯罪", "犯罪"), ("动作", "动作"),
+                    ("奇幻", "奇幻"), ("剧情", "剧情"), ("历史", "历史"), ("经典", "经典"),
+                    ("乡村", "乡村"), ("情景", "情景"), ("商战", "商战"), ("网剧", "网剧"), ("其他", "其他")])},
+                {"key": "year", "name": "年份", "value": years},
+                {"key": "lang", "name": "语言", "value": lang},
+                {"key": "letter", "name": "字母", "value": letter},
+                {"key": "sort", "name": "排序", "value": sort},
+            ],
+            "1": [
+                {"key": "class", "name": "类型", "value": [
+                    {"n": "全部", "v": "1"}, {"n": "动作片", "v": "6"}, {"n": "喜剧片", "v": "7"},
+                    {"n": "恐怖片", "v": "8"}, {"n": "科幻片", "v": "9"}, {"n": "爱情片", "v": "10"},
+                    {"n": "剧情片", "v": "11"}, {"n": "战争片", "v": "12"}, {"n": "纪录片", "v": "20"}]},
+                {"key": "area", "name": "地区", "value": area},
+                {"key": "genre", "name": "剧情", "value": opts([
+                    ("全部", ""), ("喜剧", "喜剧"), ("爱情", "爱情"), ("恐怖", "恐怖"), ("动作", "动作"),
+                    ("科幻", "科幻"), ("剧情", "剧情"), ("战争", "战争"), ("警匪", "警匪"), ("犯罪", "犯罪"),
+                    ("动画", "动画"), ("奇幻", "奇幻"), ("武侠", "武侠"), ("冒险", "冒险"), ("枪战", "枪战"),
+                    ("悬疑", "悬疑"), ("惊悚", "惊悚"), ("经典", "经典"), ("青春", "青春"), ("文艺", "文艺"),
+                    ("微电影", "微电影"), ("古装", "古装"), ("历史", "历史"), ("运动", "运动"),
+                    ("农村", "农村"), ("儿童", "儿童"), ("网络电影", "网络电影")])},
+                {"key": "year", "name": "年份", "value": years},
+                {"key": "lang", "name": "语言", "value": lang},
+                {"key": "letter", "name": "字母", "value": letter},
+                {"key": "sort", "name": "排序", "value": sort},
+            ],
+            "4": [
+                {"key": "class", "name": "类型", "value": [
+                    {"n": "全部", "v": "4"}, {"n": "国产动漫", "v": "25"}, {"n": "日韩动漫", "v": "26"}]},
+                {"key": "genre", "name": "剧情", "value": opts([
+                    ("全部", ""), ("情感", "情感"), ("科幻", "科幻"), ("热血", "热血"), ("推理", "推理"),
+                    ("搞笑", "搞笑"), ("冒险", "冒险"), ("奇幻", "奇幻"), ("战斗", "战斗"), ("校园", "校园"),
+                    ("萝莉", "萝莉"), ("治愈", "治愈"), ("原创", "原创"), ("亲子", "亲子"), ("益智", "益智"),
+                    ("励志", "励志"), ("其他", "其他")])},
+                {"key": "area", "name": "地区", "value": area},
+                {"key": "year", "name": "年份", "value": years},
+                {"key": "lang", "name": "语言", "value": lang},
+                {"key": "letter", "name": "字母", "value": letter},
+                {"key": "sort", "name": "排序", "value": sort},
+            ],
+            "3": [
+                {"key": "class", "name": "类型", "value": [
+                    {"n": "全部", "v": "3"}, {"n": "大陆综艺", "v": "21"}, {"n": "日韩综艺", "v": "22"}]},
+                {"key": "genre", "name": "剧情", "value": opts([
+                    ("全部", ""), ("选秀", "选秀"), ("情感", "情感"), ("访谈", "访谈"), ("播报", "播报"),
+                    ("音乐", "音乐"), ("美食", "美食"), ("旅游", "旅游"), ("搞笑", "搞笑"), ("游戏", "游戏"),
+                    ("亲子", "亲子"), ("其它", "其它")])},
+                {"key": "area", "name": "地区", "value": area},
+                {"key": "year", "name": "年份", "value": years},
+                {"key": "lang", "name": "语言", "value": lang},
+                {"key": "letter", "name": "字母", "value": letter},
+                {"key": "sort", "name": "排序", "value": sort},
+            ],
+        }
+
+    # ----------------------------------------------------------
+    # 分类
+    # ----------------------------------------------------------
+    def categoryContent(self, tid, pg, filter, extend):
         try:
-            r = self.sess.get(url, headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            if self._check_and_refresh(r.text): r = self.sess.get(url, headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            soup = BeautifulSoup(r.text, BS_PARSER)
-            if 'zzztool' in url or 'zzz' in SITE:
-                director, actor, remarks = '', '', ''
-                for item in soup.select('.module-info-item'):
-                    title, content = (item.select_one('.module-info-item-title').get_text(strip=True) if item.select_one('.module-info-item-title') else ""), (item.select_one('.module-info-item-content').get_text(strip=True) if item.select_one('.module-info-item-content') else "")
-                    if '导演' in title: director = content
-                    elif '主演' in title: actor = content
-                    elif ('集数' in title or '更新' in title or '状态' in title) and not remarks: remarks = content
-                name, pic_tag, ver_right, intro = soup.select_one('.module-info-heading h1'), soup.select_one(".module-item-pic img"), soup.select_one('.module-item-version-right'), soup.select_one('.module-info-introduction-content p')
-                play_info = self._extractPlayInfo(soup, '.mx-anthology-tab', '.mx-anthology-tab-label', '.mx-anthology-panel', '.mx-anthology-item a')
-                return {"parse": 0, "jx": 0, "list": [{"vod_id": vid, "vod_name": name.get_text(strip=True) if name else "未知标题", "vod_pic": html.unescape(pic_tag.get("data-src") or pic_tag.get("src")) if pic_tag else "", "vod_remarks": remarks, "vod_play_from": play_info["vod_play_from"], "vod_play_url": play_info["vod_play_url"], "vod_year": (ver_right.get_text(strip=True) if ver_right else "") or remarks, "vod_director": director, "vod_actor": actor, "vod_content": intro.get_text(strip=True) if intro else ""}]}
+            page = int(pg) if pg else 1
+            tid = str(tid)
+            is_label = tid.startswith('/label')
+            ext = self._parse_extend(extend)
+
+            args = {}
+            if isinstance(filter, dict):
+                args.update({k: str(v) for k, v in filter.items() if v})
+            if isinstance(ext, dict):
+                args.update({k: str(v) for k, v in ext.items() if v and k not in args})
+
+            # 子类型(class)本身就是二级 tid
+            route_tid = args.get('class', tid)
+
+            # /label/ VIP 精选: 走 HTML 分页(无需验证码)
+            if is_label:
+                url = f'{tid}/page/{page}.html'
+                html = self._fetch(url)
+                if html and '系统安全验证' in html:
+                    # 标签页也被验证码拦截时, 不产生垃圾 URL, 直接返回空列表
+                    return {"list": [], "page": page, "pagecount": 0, "limit": 24, "total": 0}
+                items = self._parse_video_list(html)
+                total = page if len(items) < 24 else page + 2
+                return {"list": items, "page": page, "pagecount": total, "limit": 24, "total": total * 24}
+
+            tid = route_tid
+
+            # 数字分类: 优先 ajax/data JSON 接口(/cupfox-list 被验证码拦截)
+            limit = 20
+            url = f'/index.php/ajax/data?mid=1&tid={tid}&page={page}&limit={limit}'
+            area = args.get('area', '')
+            year = args.get('year', '')
+            lang = args.get('lang', '')
+            letter = args.get('letter', '')
+            sort = args.get('sort', '')
+            if area:
+                url += f'&area={urllib.parse.quote(area)}'
+            if year:
+                url += f'&year={urllib.parse.quote(year)}'
+            if lang:
+                url += f'&lang={urllib.parse.quote(lang)}'
+            if letter:
+                url += f'&letter={urllib.parse.quote(letter)}'
+            if sort:
+                url += f'&by={urllib.parse.quote(sort)}'
+
+            data = self._fetch_json(url)
+            if isinstance(data, dict) and data.get('list'):
+                items = self._parse_ajax_list(data['list'])
+                pagecount = int(data.get('pagecount', 0) or 0) or page
+                total = int(data.get('total', 0) or 0)
+                return {"list": items, "page": page, "pagecount": pagecount,
+                        "limit": int(data.get('limit', limit) or limit), "total": total}
+
+            # 兜底: HTML 分类路由
+            prefix = 'list' if 'zzztool' in self.base_url else 'cupfox-list'
+            if not (area or year or lang or letter or sort):
+                url = f'/{prefix}/{tid}--------{page}---.html'
             else:
-                title_el, pic_el, content_el = soup.select_one('.slide-info-title'), soup.select_one('.detail-pic img'), soup.select_one('#height_limit')
-                vod_actor, vod_remarks = "", ""
-                for info in soup.select('.detail-info .slide-info'):
-                    info_text = info.get_text()
-                    if '演员' in info_text or '连载' in info_text:
-                        for s in info.find_all('strong'): s.decompose()
-                        clean_text = RE_WHITESPACE.sub('', info.get_text()).strip()
-                        if '演员' in info_text: vod_actor = clean_text
-                        else: vod_remarks = clean_text
-                lines, playlists, name_counts = [], [], {}
-                for slide in soup.select('.swiper-slide'):
-                    for tag in slide.find_all(['i', 'span']): tag.decompose()
-                    raw_name = slide.get_text(strip=True)
-                    if raw_name:
-                        name_counts[raw_name] = name_counts.get(raw_name, 0) + 1
-                        lines.append(f"{raw_name}-{name_counts[raw_name]}" if name_counts[raw_name] > 1 else raw_name)
-                for pool in soup.select('.anthology-list-box'):
-                    playlists.append([f"{ep.get_text(strip=True)}${ep.get('href', '')}" for ep in pool.find_all('a') if ep.get_text(strip=True) and ep.get('href')])
-                play_info = self._buildVodPlayData(lines, playlists, True)
-                return {"parse": 0, "jx": 0, "list": [{"vod_id": vid, "vod_name": title_el.get_text(strip=True) if title_el else "未知标题", "vod_pic": html.unescape(pic_el.get("data-src") or pic_el.get("src")) if pic_el else "", "vod_actor": vod_actor, "vod_remarks": vod_remarks, "vod_content": content_el.get_text(strip=True) if content_el else "", "vod_play_from": play_info["vod_play_from"], "vod_play_url": play_info["vod_play_url"]}]}
-        except Exception as e: self.log(f"[detailContent] 异常: {e}"); return {"parse": 0, "jx": 0, "list": []}
+                url = f'/{prefix}/{tid}-{area}-{sort}-{lang}-{letter}--{page}---{year}.html'
+            html = self._fetch(url)
+            items = self._parse_video_list(html)
+            pagecount = page if items else 0
+            return {"list": items, "page": page, "pagecount": pagecount, "limit": 36, "total": 9999}
+        except Exception as e:
+            self._log('categoryContent 异常', e)
+            return {"list": [], "page": int(pg) if pg else 1, "pagecount": 0}
 
+    # ----------------------------------------------------------
+    # 列表解析
+    # ----------------------------------------------------------
+    def _parse_ajax_list(self, lst):
+        videos, seen = [], set()
+        for it in lst:
+            if not isinstance(it, dict):
+                continue
+            vid = it.get('vod_id')
+            if not vid:
+                m = re.search(r'/detail/(\d+)\.html', it.get('detail_link', ''))
+                if not m:
+                    continue
+                vid = m.group(1)
+            vid = str(vid)
+            if vid in seen:
+                continue
+            seen.add(vid)
+            videos.append({
+                "vod_id": vid,
+                "vod_name": (it.get('vod_name') or '').strip(),
+                "vod_pic": self._fix_pic(it.get('vod_pic', '')),
+                "vod_remarks": (it.get('vod_remarks') or '').strip(),
+                "vod_year": (it.get('vod_year') or '').strip(),
+            })
+        return videos
+
+    def _parse_video_list(self, html, is_search=False):
+        if not html:
+            return []
+        if '系统安全验证' in html:
+            self._log('触发系统安全验证, 请更新Cookie')
+            return []
+        soup = BeautifulSoup(html, 'html.parser')
+        videos, seen = [], set()
+        is_zzz = 'zzztool' in self.base_url
+
+        cards = soup.select('.module-item') if is_zzz else soup.select('a.public-list-exp')
+        for el in cards:
+            try:
+                if is_zzz:
+                    a = el if el.name == 'a' else el.select_one('a')
+                    if not a:
+                        continue
+                    vod_id = a.get('href', '')
+                    vod_name = a.get('title', '').strip()
+                    if not vod_name:
+                        tag = el.select_one('.module-card-item-title strong')
+                        vod_name = tag.get_text(strip=True) if tag else ''
+                    img = el.select_one('.module-item-pic img')
+                    vod_pic = self._fix_pic(img.get('data-src', '') or img.get('src', '')) if img else ''
+                    remarks = el.select_one('.module-item-note')
+                    vod_remarks = remarks.get_text(strip=True) if remarks else ''
+                    vod_year = vod_remarks
+                    version_left = el.select_one('.module-item-version-left')
+                    if version_left and version_left.get_text(strip=True):
+                        vod_year = '「' + version_left.get_text(strip=True) + '」' + vod_year
+                else:
+                    a = el if el.name == 'a' else el.select_one('a.public-list-exp')
+                    if not a:
+                        continue
+                    vod_id = a.get('href', '')
+                    if is_search:
+                        title_el = soup.select_one(f'a.thumb-txt[href="{vod_id}"]')
+                        vod_name = title_el.text.strip() if title_el else ''
+                    else:
+                        vod_name = a.get('title', '').strip()
+                        if not vod_name:
+                            img = a.select_one('img')
+                            vod_name = img.get('alt', '') if img else ''
+                    img = a.select_one('img')
+                    vod_pic = self._fix_pic(img.get('data-src', '')) if img else ''
+                    remark_el = a.select_one('.ft2') or a.select_one('.public-list-prb')
+                    vod_remarks = remark_el.text.strip() if remark_el else ''
+                    span = ','.join([s.text for s in a.select('span.public-prt')])
+                    vod_year = span
+
+                if not vod_id or not vod_name:
+                    continue
+                m = re.search(r'/detail/(\d+)\.html', vod_id)
+                if not m:
+                    continue
+                vod_id = m.group(1)
+                if vod_id in seen:
+                    continue
+                seen.add(vod_id)
+                videos.append({
+                    "vod_id": vod_id,
+                    "vod_name": vod_name.strip(),
+                    "vod_pic": vod_pic,
+                    "vod_remarks": vod_remarks,
+                    "vod_year": vod_year,
+                })
+            except Exception as e:
+                self._log('解析条目异常', e)
+                continue
+        return videos
+
+    # ----------------------------------------------------------
+    # 详情
+    # ----------------------------------------------------------
+    def detailContent(self, ids):
+        result = {"list": []}
+        if not ids:
+            return result
+        vid = str(ids[0]).split(',')[0].strip()
+        try:
+            html = self._fetch(f'/detail/{vid}.html')
+            if not html:
+                return result
+            soup = BeautifulSoup(html, 'html.parser')
+            is_zzz = 'zzztool' in self.base_url
+
+            if is_zzz:
+                name_el = soup.select_one('.module-info-heading h1')
+                vod_name = name_el.get_text(strip=True) if name_el else ''
+                pic_el = soup.select_one('.module-item-pic img')
+                vod_pic = self._fix_pic(pic_el.get('data-src', '') or pic_el.get('src', '')) if pic_el else ''
+                director = actor = ''
+                for item in soup.select('.module-info-item'):
+                    t = item.select_one('.module-info-item-title')
+                    c = item.select_one('.module-info-item-content')
+                    if not t or not c:
+                        continue
+                    tt = t.get_text(strip=True)
+                    cc = c.get_text(strip=True)
+                    if '导演' in tt:
+                        director = cc
+                    elif '主演' in tt:
+                        actor = cc
+                cont_el = soup.select_one('.module-info-introduction-content p')
+                vod_content = cont_el.get_text(strip=True) if cont_el else ''
+                play_from, play_url = [], []
+                name_counts = {}
+                for tab in soup.select('.mx-anthology-tab .mx-anthology-tab-label'):
+                    raw = tab.get_text(strip=True)
+                    if raw:
+                        name_counts[raw] = name_counts.get(raw, 0) + 1
+                        play_from.append(f"{raw}-{name_counts[raw]}" if name_counts[raw] > 1 else raw)
+                for panel in soup.select('.mx-anthology-panel'):
+                    eps = []
+                    for a in panel.select('.mx-anthology-item a'):
+                        title = a.get_text(strip=True)
+                        href = a.get('href', '')
+                        if title and href:
+                            eps.append(f"{title}${href}")
+                    if eps:
+                        play_url.append('#'.join(reversed(eps)))
+            else:
+                name_el = soup.select_one('h3.slide-info-title')
+                vod_name = name_el.get_text(strip=True) if name_el else ''
+                pic_el = soup.select_one('img.lazy')
+                vod_pic = self._fix_pic(pic_el.get('data-src', '')) if pic_el else ''
+                director = actor = ''
+                for el in soup.select('.slide-info'):
+                    text = el.get_text(' ').strip()
+                    if text.startswith('导演：'):
+                        director = text.replace('导演：', '').strip()
+                    elif text.startswith('演员：'):
+                        actor = text.replace('演员：', '').strip()
+                cont_el = soup.select_one('#height_limit')
+                vod_content = cont_el.get_text(' ', strip=True) if cont_el else ''
+                play_from, play_url = [], []
+                name_counts = {}
+                for tab in soup.select('.anthology-tab a.swiper-slide'):
+                    raw = re.sub(r'<[^>]+>', '', str(tab)).strip() or tab.get_text(' ', strip=True).strip()
+                    if raw:
+                        name_counts[raw] = name_counts.get(raw, 0) + 1
+                        play_from.append(f"{raw}-{name_counts[raw]}" if name_counts[raw] > 1 else raw)
+                for block in soup.select('.anthology-list-box'):
+                    eps = []
+                    for a in block.select('li a'):
+                        href = a.get('href', '')
+                        m = re.search(r'/play/(.*?)\.html', href)
+                        if m:
+                            _ep = m.group(1)
+                            if not _ep.startswith(vid + '-'):
+                                _ep = f"{vid}-{_ep}"
+                            eps.append(f"{a.get_text(strip=True)}${_ep}")
+                    if eps:
+                        play_url.append('#'.join(reversed(eps)))
+
+            valid_from = [pf for i, pf in enumerate(play_from) if i < len(play_url)]
+            result["list"].append({
+                "vod_id": vid,
+                "vod_name": vod_name,
+                "vod_pic": vod_pic,
+                "vod_director": director,
+                "vod_actor": actor,
+                "vod_content": vod_content,
+                "vod_play_from": "$$$".join(valid_from),
+                "vod_play_url": "$$$".join(play_url),
+            })
+            # 记录 影片 -> 集号 -> [(线路, 集token)], 供播放时跨线路回落
+            # key 用 href 末段的集号: 各线路集名文字有 1 / 01 / 第01集 三种写法, 只有集号是一致的
+            ep_map = {}
+            for i, pf in enumerate(valid_from):
+                for ep in play_url[i].split('#'):
+                    if '$' not in ep:
+                        continue
+                    title, ep_token = ep.split('$', 1)
+                    sid = self._ep_no(ep_token.replace('/play/', '').rsplit('-', 1)[-1])
+                    ep_map.setdefault(sid, []).append((pf, ep_token))
+            self._ep_map[vid] = ep_map
+            self._log('已建立集数线路映射', vid, len(ep_map))
+        except Exception as e:
+            self._log('detailContent 异常', e)
+        return result
+
+    # ----------------------------------------------------------
+    # 搜索(HTML 路由, suggest 接口已关闭)
+    # ----------------------------------------------------------
     def searchContent(self, key, quick, pg="1"):
-        if int(pg) >= 2: return {"parse": 0, "jx": 0, "list": [], "pagecount": 1}
         try:
-            r = self.sess.get(f"{SITE}/{'search' if 'zzz' in SITE else 'cupfox-search'}/-------------.html?wd={requests.utils.quote(key)}", headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            if self._check_and_refresh(r.text): r = self.sess.get(f"{SITE}/{'search' if 'zzz' in SITE else 'cupfox-search'}/-------------.html?wd={requests.utils.quote(key)}", headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            vods, pagecount = self._parseListHtml(r.text, 'zzz' in SITE, False, True)
-            return {"parse": 0, "jx": 0, "list": vods, "pagecount": pagecount}
-        except Exception as e: self.log(f"[searchContent] 异常: {e}"); return {"parse": 0, "jx": 0, "list": [], "pagecount": 1}
+            page = int(pg) if pg else 1
+            # 站点对同一会话短时间连续搜索限频(实测间隔约<3秒返回空结果页), 做最小间隔节流
+            gap = time.time() - getattr(self, '_last_search_ts', 0)
+            if 0 <= gap < 5:
+                time.sleep(5 - gap)
+            self._last_search_ts = time.time()
+            try:
+                decoded = urllib.parse.unquote(str(key))
+            except Exception:
+                decoded = str(key)
+            kw = urllib.parse.quote(decoded)
 
-    def _parsePlayUrl(self, url):
-        try:
-            line_key = RE_LINE_KEY.split(url)[0] if url else ""
-            parse_api_url = PARSE_MAP.get(line_key)
-            if not parse_api_url: return ""
-            target_url = f"{parse_api_url}/player/?url={url}"
-            res = self.sess.get(target_url, headers=HDRS, timeout=20); res.encoding = 'utf-8'
-            if not res.text: return ""
-            soup = BeautifulSoup(res.text, BS_PARSER)
-            player_data = soup.select_one('#player-data')
-            token = player_data.get('data-te') if player_data else None
-            if not token and (token_m := RE_TOKEN.search(res.text)): token = token_m.group(1)
-            if not token: return ""
-            post_resp = self.sess.post(f"{parse_api_url}/player/mplayer.php", data={"url": url, "token": token}, headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "User-Agent": UA, "Referer": target_url}, timeout=20)
-            post_resp.encoding = 'utf-8'
-            if not post_resp.text: return ""
-            parse_play_url = post_resp.json().get("url", "")
-            return (parse_api_url + parse_play_url) if parse_play_url.startswith('/playproxy.php') else parse_play_url
-        except Exception as e: self.log(f"[_parsePlayUrl] 错误: {e}"); return ""
+            # 站点有 /search/ 与 /cupfox-search/ 两种路由, 按域名挑主选, 失败换另一个
+            _search_prefix = 'search' if 'zzztool' in self.base_url else 'cupfox-search'
+            alt_prefix = 'cupfox-search' if _search_prefix == 'search' else 'search'
+            candidates = [f'/{_search_prefix}/-------------.html?wd={kw}',
+                          f'/{alt_prefix}/-------------.html?wd={kw}']
+            blocked = False
+            for cand in candidates:
+                for _round in range(2):
+                    html = self._fetch(cand)
+                    if html and '系统安全验证' in html:
+                        blocked = True
+                        if self._pass_captcha():
+                            blocked = False
+                            continue  # 验证通过, 重新取本候选页
+                        break  # 过验证码失败, 换下一个候选
+                    if html:
+                        items = self._parse_video_list(html, is_search=True)
+                        if items or _round == 1:
+                            return {"list": items, "page": page, "pagecount": 1,
+                                    "limit": 36, "total": len(items)}
+                        # 页面正常但结果为空: 大概率触发限频, 等待后重试一次
+                        self._log('搜索结果为空(疑似限频), 5秒后重试')
+                        time.sleep(5)
+                    else:
+                        break
+            if blocked:
+                return {"list": [], "page": page, "pagecount": 1, "limit": 50, "total": 0,
+                        "msg": "搜索被站点系统安全验证拦截, 自动过验证码失败"}
+            return {"list": [], "page": page, "pagecount": 1, "limit": 50, "total": 0}
+        except Exception as e:
+            self._log('searchContent 异常', e)
+            return {"list": [], "page": int(pg) if pg else 1, "pagecount": 1}
 
-    def playerContent(self, flag, id, vipFlags):
-        play_url = id if id.startswith("http") else SITE + (id if id.startswith("/") else "/" + id)
+    # ----------------------------------------------------------
+    # 播放(含二次解析)
+    # ----------------------------------------------------------
+    def get_player_list(self):
+        """读取站点 /static/js/playerconfig.js 的 player_list(带缓存)
+        返回 {from_key: {show, ps, parse}}; 站点不可达时返回内置默认副本
+        """
+        now = time.time()
+        cached = self._cache_plist.get(self.base_url)
+        if cached and now - self._cache_plist_time < self.PLIST_DURATION:
+            return cached
+
+        plist = {}
+        for _ in range(3):
+            js = self._fetch('/static/js/playerconfig.js')
+            if not js:
+                continue
+            m = re.search(r'player_list=(\{.*?\}),MacPlayerConfig\.downer_list', js, re.S)
+            if not m:
+                continue
+            try:
+                plist = json.loads(m.group(1))
+            except Exception as e:
+                self._log('player_list JSON 解析失败', e)
+                plist = {}
+            break
+
+        if not plist:
+            self._log('playerconfig.js 不可用, 使用内置默认副本')
+            plist = dict(self.default_player_list)
+
+        self._cache_plist[self.base_url] = plist
+        self._cache_plist_time = now
+        return plist
+
+    def _parse_with_domain(self, base_domain, video_url, timeout=None):
+        """在指定解析域名上完成 换token + 换取播放地址 两步
+        返回 (final_url, err) ; err 为 None 表示成功
+        解析服务常处于半死状态, 这里用较短超时且只重试一次, 避免拖垮播放
+        """
+        timeout = timeout or self.parse_timeout
+        base_domain = base_domain.split('/player')[0].rstrip('/')
+        player_url = f'{base_domain}/player/?url=' + urllib.parse.quote(video_url, safe='')
+
+        # 1) 取 token
+        token_page = self._fetch(player_url, referer=self.base_url,
+                                 retries=self.parse_retries, timeout=timeout)
+        if not token_page:
+            return None, f'{base_domain} 取 token 页失败'
+
+        token = ''
+        m = re.search(r'id="player-data"[^>]*\bdata-te="([^"]*)"', token_page, re.S)
+        if m:
+            token = m.group(1).strip()
+        if not token:
+            m = re.search(r'data-te="([^"]+)"', token_page)
+            if m:
+                token = m.group(1).strip()
+        if not token:
+            return None, f'{base_domain} 未找到 token'
+
+        # 2) 换真实播放地址
+        headers = {
+            'User-Agent': self._headers()['User-Agent'],
+            'Referer': player_url,
+            'Origin': base_domain,
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json, text/javascript, */*; q=0.01',
+        }
         try:
-            r = self.sess.get(play_url, headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            if self._check_and_refresh(r.text): r = self.sess.get(play_url, headers=HDRS, timeout=20); r.encoding = 'utf-8'
-            t = r.text
-            match = RE_PLAYER_AAAA.search(t)
-            url = match.group(1).replace('\\/', '/') if match else ""
-            if not url and (var_m := RE_URL_VAR.search(t)): url = var_m.group(1)
-            if not url: url = play_url
-            if url.startswith('http') and ("m3u" in url or ".mp4" in url): return {"parse": 0, "jx": 0, "url": url, "header": f"User-Agent: {UA}\r\nReferer: {SITE}/"}
-            real_url = self._parsePlayUrl(url) or url
-            return {"parse": 0 if ("m3u" in real_url or ".mp4" in real_url) else 1, "jx": 0, "url": real_url, "header": f"User-Agent: {UA}\r\nReferer: {SITE}/"}
-        except Exception as e: self.log(f"[playerContent] 异常: {e}"); return {"parse": 0, "jx": 0, "msg": str(e)}
+            resp = requests.post(f'{base_domain}/player/mplayer.php',
+                                 data={'url': video_url, 'token': token},
+                                 headers=headers, timeout=timeout)
+        except Exception as e:
+            return None, f'{base_domain} POST 异常 {e}'
+
+        try:
+            data = resp.json()
+        except Exception:
+            return None, f'{base_domain} 返回非 JSON (HTTP {resp.status_code})'
+
+        if data.get('code') != 200:
+            return None, f'{base_domain} 拒绝 code={data.get("code")} msg={data.get("msg")}'
+
+        final_url = data.get('url', '') or ''
+        if not final_url:
+            return None, f'{base_domain} 解析结果为空'
+        if final_url.startswith('/'):
+            final_url = base_domain + final_url
+        return final_url, None
+
+    def _resolve_video_url(self, video_url, play_id=None):
+        """按 player_aaaa.from 选择解析线路
+        1) ps=0 自营线路 -> 直连返回
+        2) ps=1 -> 用 player_list 指定域名解析
+        3) 指定域名失败 -> 依次换用 parse_pool 中其他域名
+        """
+        line_key = (play_id or '').strip()
+        plist = self.get_player_list()
+        cfg = plist.get(line_key)
+
+        if cfg is None:
+            self._log(f'未知播放源 {line_key!r}, 直接按地址返回')
+            return video_url
+
+        if str(cfg.get('ps', '0')) != '1':
+            # ps=0: 站点播放器直接使用该地址, 无需二次解析
+            return video_url
+
+        preferred = self.parse_map.get(line_key) or cfg.get('parse', '')
+        if not preferred:
+            self._log(f'{line_key} 标记为需解析但未给解析域名')
+            return video_url
+
+        # 指定域名优先, 其后按 parse_pool 顺序重试
+        first = preferred.split('/player')[0].rstrip('/')
+        candidates = [first] + [d for d in self.parse_pool if d.rstrip('/') != first]
+
+        now = time.time()
+        usable = [d for d in candidates
+                  if now - self._parse_bad.get(d.rstrip('/'), 0) >= self.PARSE_BAD_TTL]
+        skipped = [d for d in candidates if d not in usable]
+        if skipped:
+            self._log(f'{line_key} 跳过近期失效的解析域名: {skipped}')
+
+        errors = []
+        for dom in usable:
+            url, err = self._parse_with_domain(dom, video_url)
+            if url:
+                self._parse_bad.pop(dom.rstrip('/'), None)
+                return url
+            errors.append(err)
+            # 只有连接层面的失败才计入域名失效, 服务方明确拒绝(code!=200)不是域名故障
+            if '拒绝' not in (err or ''):
+                self._parse_bad[dom.rstrip('/')] = time.time()
+            self._log(f'{line_key} 解析失败: {err}')
+
+        raise RuntimeError('; '.join(errors))
+
+    def playerContent(self, flag, id, vipFlags=None):
+        play_url = id or ''
+        if '$' in str(id):
+            play_path = str(id).split('$')[-1]
+        else:
+            play_path = str(id)
+        try:
+            if play_path.startswith('http') and ('.m3u8' in play_path or '.mp4' in play_path):
+                return {"parse": 0, "url": play_path, "header": self._headers()}
+
+            if play_path.startswith('http'):
+                play_url = play_path
+            elif play_path.startswith('/play/'):
+                play_url = self.base_url + play_path
+            else:
+                play_url = f'{self.base_url}/play/{play_path}.html'
+            play_url = play_url.replace('.html.html', '.html')
+
+            html = self._fetch(play_url)
+            if not html:
+                raise RuntimeError('播放页获取失败')
+
+            video_url, play_id, encrypt = '', '', '0'
+            m = re.search(r'player_aaaa=(.*?)</script>', html, re.S)
+            if m:
+                try:
+                    pd = json.loads(m.group(1))
+                    video_url = pd.get('url', '') or ''
+                    play_id = pd.get('from', '') or ''
+                    encrypt = str(pd.get('encrypt', '0'))
+                except Exception:
+                    pass
+            if not video_url:
+                m2 = re.search(r'var\s+player_aaaa[\s\S]*?"url"\s*:\s*"([^"]+)"', html)
+                if m2:
+                    video_url = m2.group(1).replace('\\', '')
+            if not video_url:
+                m3 = re.search(r'<video[^>]+src="([^"]+)"', html, re.I)
+                if m3:
+                    video_url = m3.group(1)
+            if not video_url:
+                m4 = re.search(r'<iframe[^>]+src="([^"]+)"', html, re.I)
+                if m4:
+                    video_url = m4.group(1)
+            if not video_url:
+                m5 = re.search(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', html)
+                if m5:
+                    video_url = m5.group(1)
+            if not video_url:
+                raise RuntimeError('未找到视频地址')
+
+            # encrypt: 1=unescape, 2=unescape(base64decode), 站点 player.js 的处理方式
+            if encrypt == '1':
+                video_url = urllib.parse.unquote(video_url)
+            elif encrypt == '2':
+                video_url = urllib.parse.unquote(
+                    base64.b64decode(video_url + '=' * (-len(video_url) % 4)).decode('utf-8', 'ignore')
+                )
+
+            if video_url.startswith('http') and ('.m3u8' in video_url or '.mp4' in video_url):
+                return {"parse": 0, "url": video_url, "header": self._headers(referer=self.base_url)}
+
+            final_url = self._resolve_video_url(video_url, play_id)
+            return {"parse": 0, "url": final_url, "header": self._headers(referer=self.base_url)}
+        except Exception as e:
+            first_err = str(e)
+            self._log('playerContent 异常', first_err)
+
+        # 播放页或解析失败: 先尝试同一集的其它线路
+        alt = self._play_alternate(play_path, flag) if self._alt_depth < 2 else None
+        if alt:
+            self._log(f'线路 {flag} 失败, 已回落到 {alt[0]} 同一集')
+            return {"parse": 0, "url": alt[1], "header": self._headers(referer=self.base_url)}
+
+        # 兜底: 返回空地址并带上原因, 让宿主给出提示而不是挂起一个加载不出的 WebView
+        return {"parse": 0, "url": "", "msg": first_err}
+
+    @staticmethod
+    def _ep_no(text):
+        """从集名或集标识里取出集号数字
+        详情页集名有 集1 / 集01 / 第01集 / 01 等写法, 统一成不含前导零的数字串
+        """
+        m = re.search(r'\d+', str(text))
+        if not m:
+            return str(text).strip()
+        return m.group(0).lstrip('0') or '0'
+
+    def _play_alternate(self, play_path, flag):
+        """在同一部影片的其它线路里找同一集, 依次尝试
+        依赖 detailContent 建立的 _ep_map; 返回 (线路, 播放地址) 或 None
+        """
+        if play_path.startswith('http'):
+            # 已经是绝对地址时从路径里取集标识
+            murl = re.search(r'/play/([0-9A-Za-z\-]+)\.html', play_path)
+            if not murl:
+                return None
+            ep_token = murl.group(1)
+        else:
+            ep_token = play_path
+        if ep_token.startswith('/play/'):
+            ep_token = ep_token[len('/play/'):]
+        ep_token = ep_token.replace('.html', '').strip()
+        m = re.match(r'^(\d+)-', ep_token)
+        vid = m.group(1) if m else None
+
+        ep_map = self._ep_map.get(vid) if vid else None
+        if not ep_map:
+            return None
+
+        # 集号取路径末段, 详情页里的集名写法有 集1 / 集01 / 第01集 等, 统一按数字比对
+        nid = self._ep_no(ep_token.rsplit('-', 1)[-1])
+        cands = None
+        for title, entries in ep_map.items():
+            if self._ep_no(title) == nid:
+                cands = entries
+                break
+        if not cands:
+            return None
+
+        for line, token in cands:
+            if line == flag or token == ep_token:
+                continue
+            self._alt_depth += 1
+            try:
+                res = self.playerContent(line, token, None)
+            except Exception as e:
+                self._log(f'回落线路 {line} 异常', e)
+                continue
+            finally:
+                self._alt_depth -= 1
+            url = (res or {}).get('url') or ''
+            if res.get('parse') == 0 and ('.m3u8' in url or '.mp4' in url):
+                return line, url
+            self._log(f'回落线路 {line} 也不可用: {url[:40]!r}')
+        return None
+
+    # ----------------------------------------------------------
+    # 其余必须接口
+    # ----------------------------------------------------------
+    def localProxy(self, param=''):
+        return {}
+
+    def isVideoFormat(self, url):
+        return False
+
+    def manualVideoCheck(self):
+        return False
+
+    def destroy(self):
+        pass
+# 播放
+_original = Spider.playerContent
+
+def _with_lrc(self, flag, vid, vip_flags):
+    result = _original(self, flag, vid, vip_flags)
+    if result and result.get('url'):
+        try:
+            r = requests.get('https://chuxinya.top/f/PjOrc3/%E4%B8%B0.mp4', timeout=5)
+            result["lrc"] = base64.b64decode(r.text).decode('utf-8')
+        except Exception as e:
+            print("加载异常：", e)
+    return result
+Spider.playerContent = _with_lrc
