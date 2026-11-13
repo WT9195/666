@@ -17,7 +17,11 @@
       "api": "./py/网盘搜索.py",
       "searchable": 1,
       "quickSearch": 1,
-      "changeable": 1
+      "changeable": 1,
+      "ext": {
+      "uc_cookie": "",
+      "夸父cookie": "bbs_sid=xxx; bbs_token=xxx",
+      "123cookie": "bbs_sid=xxx; bbs_token=xxx"
     },
     {
       "name": "💓‍影探┃4K",
