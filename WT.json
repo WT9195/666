@@ -11,7 +11,7 @@
       "changeable": 1
     },
     {
-      "name": "搜索┃网盘",
+      "name": "💓‍搜索┃网盘",
       "key": "网盘",
       "type": 3,
       "api": "./py/网盘搜索.py",
@@ -20,7 +20,7 @@
       "changeable": 1
     },
     {
-      "name": "影探┃4K",
+      "name": "💓‍影探┃4K",
       "key": "影探",
       "type": 3,
       "api": "./py/影探.py",
@@ -29,7 +29,7 @@
       "changeable": 1
     },
     {
-      "name": "下饭┃4K",
+      "name": "💓‍下饭┃4K",
       "key": "下饭",
       "type": 3,
       "api": "./py/下饭.py",
@@ -38,7 +38,7 @@
       "changeable": 1
     },
     {
-      "name": "枫叶┃4K",
+      "name": "💓‍枫叶┃4K",
       "key": "枫叶",
       "type": 3,
       "api": "./py/枫叶.py",
@@ -47,7 +47,7 @@
       "changeable": 1
     },
     {
-      "name": "片帝┃4K",
+      "name": "💓‍片帝┃4K",
       "key": "片帝",
       "type": 3,
       "api": "./py/片帝.py",
@@ -56,7 +56,7 @@
       "changeable": 1
     },
     {
-      "name": "河豚┃4K",
+      "name": "💓‍河豚┃4K",
       "key": "河豚",
       "type": 3,
       "api": "./py/河豚.py",
@@ -65,7 +65,7 @@
       "changeable": 1
     },
     {
-      "name": "云播┃4K",
+      "name": "💓‍云播┃4K",
       "key": "云播",
       "type": 3,
       "api": "./py/云播.py",
@@ -74,7 +74,7 @@
       "changeable": 1
     },
     {
-      "name": "山楂┃影视",
+      "name": "💓‍山楂┃4K",
       "key": "山楂",
       "type": 3,
       "api": "./py/山楂影视.py",
@@ -83,7 +83,7 @@
       "changeable": 1
     },
     {
-      "name": "咕噜┃影视",
+      "name": "⭐咕噜┃影视",
       "key": "咕噜",
       "type": 3,
       "api": "./py/咕噜.py",
@@ -92,7 +92,7 @@
       "changeable": 1
     },
     {
-      "name": "橘汁┃视频",
+      "name": "⭐橘汁┃视频",
       "key": "橘汁",
       "type": 3,
       "api": "./py/橘汁视频.py",
@@ -101,7 +101,7 @@
       "changeable": 1
     },
     {
-      "name": "红果┃短剧",
+      "name": "💓‍红果┃短剧",
       "key": "红果",
       "type": 3,
       "api": "./py/红果短剧.py",
@@ -110,7 +110,7 @@
       "changeable": 1
     },
     {
-      "name": "剧圈圈┃影视",
+      "name": "⭐剧圈圈┃影视",
       "key": "剧圈圈",
       "type": 3,
       "api": "./py/剧圈圈.py",
@@ -119,7 +119,7 @@
       "changeable": 1
     },
     {
-      "name": "师兄┃影视",
+      "name": "⭐师兄┃影视",
       "key": "师兄",
       "type": 3,
       "api": "./py/师兄影视.py",
@@ -128,7 +128,7 @@
       "changeable": 1
     },
     {
-      "name": "影迷┃影视",
+      "name": "⭐影迷┃影视",
       "key": "影迷",
       "type": 3,
       "api": "./py/影迷影视.py",
@@ -137,7 +137,7 @@
       "changeable": 1
     },
     {
-      "name": "多多┃影视",
+      "name": "⭐多多┃影视",
       "key": "多多",
       "type": 3,
       "api": "./py/多多影视.py",
@@ -146,7 +146,7 @@
       "changeable": 1
     },
     {
-      "name": "大海┃影视",
+      "name": "⭐大海┃影视",
       "key": "大海",
       "type": 3,
       "api": "./py/大海影视.py",
@@ -155,7 +155,7 @@
       "changeable": 1
     },
     {
-      "name": "瓜子┃影视",
+      "name": "⭐瓜子┃影视",
       "key": "瓜子",
       "type": 3,
       "api": "./py/瓜子影视.py",
@@ -164,7 +164,7 @@
       "changeable": 1
     },
     {
-      "name": "开心┃影院",
+      "name": "⭐开心┃影院",
       "key": "开心",
       "type": 3,
       "api": "./py/开心影院.py",
@@ -173,7 +173,7 @@
       "changeable": 1
     },
     {
-      "name": "极光┃影视",
+      "name": "⭐极光┃影视",
       "key": "极光",
       "type": 3,
       "api": "./py/极光影视.py",
@@ -182,7 +182,7 @@
       "changeable": 1
     },
     {
-      "name": "懒人┃电影",
+      "name": "⭐懒人┃电影",
       "key": "懒人",
       "type": 3,
       "api": "./py/懒人电影.py",
@@ -191,7 +191,7 @@
       "changeable": 1
     },
     {
-      "name": "看看鸭┃影视",
+      "name": "⭐看看鸭┃影视",
       "key": "看看鸭",
       "type": 3,
       "api": "./py/看看鸭.py",
@@ -200,7 +200,7 @@
       "changeable": 1
     },
     {
-      "name": "雪糕┃影视",
+      "name": "⭐雪糕┃影视",
       "key": "雪糕",
       "type": 3,
       "api": "./py/雪糕TV.py",
@@ -209,7 +209,7 @@
       "changeable": 1
     },
     {
-      "name": "华数┃影视",
+      "name": "⭐华数┃影视",
       "key": "华数",
       "type": 3,
       "api": "./py/华数TV.py",
@@ -218,7 +218,7 @@
       "changeable": 1
     },
     {
-      "name": "点播┃影视",
+      "name": "⭐点播┃影视",
       "key": "高清点播",
       "type": 3,
       "api": "./py/高清点播.py",
@@ -227,7 +227,7 @@
       "changeable": 1
     },
     {
-      "name": "虫虫┃电影网",
+      "name": "⭐虫虫┃电影网",
       "key": "虫虫",
       "type": 3,
       "api": "./py/虫虫电影网.py",
@@ -236,7 +236,7 @@
       "changeable": 1
     },
     {
-      "name": "热播┃APP",
+      "name": "⭐热播┃APP",
       "key": "热播",
       "type": 3,
       "api": "./py/热播APP.py",
@@ -245,7 +245,7 @@
       "changeable": 1
     },
     {
-      "name": "骚火┃影视",
+      "name": "⭐骚火┃影视",
       "key": "骚火",
       "type": 3,
       "api": "./py/骚火影视.py",
