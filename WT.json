@@ -200,15 +200,6 @@
       "changeable": 1
     },
     {
-      "name": "⭐雪糕┃影视",
-      "key": "雪糕",
-      "type": 3,
-      "api": "./py/雪糕TV.py",
-      "searchable": 1,
-      "quickSearch": 1,
-      "changeable": 1
-    },
-    {
       "name": "⭐华数┃影视",
       "key": "华数",
       "type": 3,
