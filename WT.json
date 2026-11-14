@@ -33,7 +33,7 @@
       "123cookie": "bbs_sid=xxx; bbs_token=xxx"
     },
     {
-      "name": "💓‍影探┃4K",
+      "name": "💓影探┃4K",
       "key": "影探",
       "type": 3,
       "api": "./py/影探.py",
