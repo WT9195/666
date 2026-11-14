@@ -11,6 +11,15 @@
       "changeable": 1
     },
     {
+      "name": "💓‍免扫聚合┃4K",
+      "key": "免扫聚合",
+      "type": 3,
+      "api": "./py/免扫聚合.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "changeable": 1
+    },
+    {
       "name": "💓‍搜索┃网盘",
       "key": "网盘",
       "type": 3,
@@ -292,6 +301,15 @@
       "searchable": 1,
       "quickSearch": 1,
       "changeable": 1
-    }
+    },
+    {
+      "name": "草莓┃🔞",
+      "key": "草莓",
+      "type": 3,
+      "api": "./py/草莓视频.py",
+      "searchable": 1,
+      "quickSearch": 1,
+      "changeable": 1
+    },
   ]
 }
