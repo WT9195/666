@@ -1,8 +1,12 @@
 # coding=utf-8
 # ============================================================
-# 聚合影视 —— 多源聚合（影探 / 咕噜 / 橘汁 / 华谊）
+# 聚合影视 —— 多源聚合（影探 / 咕噜 / 橘汁 / 片帝 / 4KMP）
 # 特性：统一搜索、去重、播放失败自动换源
 # 依赖：requests, pycryptodome（盒子端缺失时自动用内置纯 Python 实现顶上）
+#
+# 2026-11 维护记录：
+#   内嵌聚合模块（Kishuto）与河豚源已彻底失效，具体原因见 SRC 上方注释，
+#   站点列表改为只挂本地自带、实测可用的 5 个源。
 # ============================================================
 import sys
 import os
@@ -661,6 +665,8 @@ EP_NUM = __import__('re').compile(r'^第?0*(\d{1,4})[集话期](?:完结)?$')
 EP_NUM2 = __import__('re').compile(r'^第?0*(\d{1,4})[集话期]$')
 VIDEO_EXT = __import__('re').compile(r'(?i).*\.(mp4|m3u8|flv|mkv|avi|ts|mov|mpd|m4a|wmv)(\?.*)?$')
 URL_RE = __import__('re').compile(r'https?://[\x21-\x7e]+')
+# ①②③… 这类续号：站点用它表示「上一组分类的第 N 页」
+_CIRCLED = u'①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳'
 
 
 # ============================================================
@@ -1436,11 +1442,19 @@ class Yingtan:
         d = self._cms('nav', {'token': ''})
         classes = []
         filters = {}
+        # 站点把同一组分类写成「热门电影① / ② / ③」这种续号形式，
+        # 直接铺出去菜单里会出现一堆只有一个「②」的分类，根本不知道点哪个。
+        # 这里把裸圈号补回上一组的前缀。
+        base = ''
         for it in (d.get('list') or []):
             tid = str(it.get('type_id', ''))
-            name = it.get('type_name', '')
+            name = str(it.get('type_name', '')).strip()
             if not tid or not name:
                 continue
+            if name and all(ch in _CIRCLED for ch in name) and base:
+                name = base + name
+            else:
+                base = name.rstrip(_CIRCLED)
             classes.append({'type_id': tid, 'type_name': name})
             if filter:
                 ext = it.get('type_extend') or {}
@@ -1521,9 +1535,14 @@ class Yingtan:
     def playerContent(self, flag, pid, vipFlags=None):
         url = self._decrypt_lvdou(pid or '')
         if not url.startswith('http'):
-            url = 'http://'
-        return {'parse': 0, 'jx': 0, 'url': url,
-                'header': {'User-Agent': self.UA}}
+            return {'parse': 0, 'jx': 0, 'url': 'http://'}
+        hdr = {'User-Agent': self.UA}
+        # 影探的线路分两类：联通云/移动云 是能直接播的 mp4，
+        # 腾讯/B站/爱奇艺/优酷 给的是网页地址。网页必须交给壳去嗅探
+        # （parse=1），parse=0 等于把 HTML 直接丢给播放器，点开就是黑屏。
+        if VIDEO_EXT.search(url):
+            return {'parse': 0, 'jx': 0, 'url': url, 'header': hdr}
+        return {'parse': 1, 'jx': 0, 'url': url, 'header': hdr}
 
 
 def _q(s):
@@ -2973,6 +2992,15 @@ class Gulu:
                     result["error"] = self.last_error
             return result
         except Exception as first_error:
+            # 429 是服务器限流（短时间内请求太多），这时候重新握手只会
+            # 再挨一次限流；停一下用原会话重试反而能过。
+            if "429" in str(first_error):
+                time.sleep(1.5)
+                try:
+                    result = self.protocol.search(keyword, page, limit, category_id)
+                    return result
+                except Exception:
+                    pass
             try:
                 self._reset_session()
                 result = self.protocol.search(keyword, page, limit, category_id)
@@ -3681,31 +3709,50 @@ class JuZhiNative:
             self._ready = False
             self._tried = True
             self._last_try = 0
+            return
+        # 握手（登录 + 取二级公钥）要 1 秒多，放在后台先做掉：
+        # 不然首次聚合搜索会在"有结果就收尾"的窗口里漏掉这个源
+        def _warm():
+            try:
+                self._ensure()
+            except Exception:
+                pass
+        try:
+            threading.Thread(target=_warm, daemon=True).start()
+        except Exception:
+            pass
 
     # 懒加载：真正要用数据时再去登录 + 取二级公钥，失败也不抛给客户端。
     # 服务端/网络偶发抖动（代理 403 等）不应把整个源永久锁死，
     # 所以这里带内部重试，且失败后隔 60 秒还允许再次尝试。
     def _ensure(self):
-        try:
-            if self._ready:
-                return True
-            now = int(time.time())
-            if self._tried and now - self._last_try < 60:
-                return False
-            self._tried = True
-            self._last_try = now
-            for _ in range(3):
-                try:
-                    self._login()
-                    self._zone()
-                    if self._rsa2 is not None:
-                        self._ready = True
-                        break
-                except Exception:
-                    pass
-                time.sleep(2)
-        except Exception:
-            self._ready = False
+        # 握手要 1 秒多。init 的后台预热和用户第一次点击可能同时进来，
+        # 早先的写法是「后到的直接判失败」，结果预热还在跑时点分类就是空的。
+        # 这里加锁串行：后到的等前一个跑完，成功了就直接用它的结果。
+        lock = getattr(self, '_elock', None)
+        if lock is None:
+            lock = self._elock = threading.Lock()
+        with lock:
+            try:
+                if self._ready:
+                    return True
+                now = int(time.time())
+                if self._tried and now - self._last_try < 20:
+                    return False
+                self._tried = True
+                self._last_try = now
+                for _ in range(3):
+                    try:
+                        self._login()
+                        self._zone()
+                        if self._rsa2 is not None:
+                            self._ready = True
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(2)
+            except Exception:
+                self._ready = False
         return bool(self._ready)
 
     def _http(self, url, data=None, headers=None):
@@ -3925,8 +3972,12 @@ class JuZhiNative:
                 return {'list': self._history_list(), 'page': 1,
                         'pagecount': 1, 'limit': 40, 'total': 40}
             qs = 'page=%d&pagesize=24&typeId1=%s' % (pg, tid)
-            return {'list': self._list(qs), 'page': pg,
-                    'pagecount': 999, 'limit': 24, 'total': 99999}
+            items = self._list(qs)
+            # 接口不给总页数，只能按本页是否装满 24 条判断还有没有下一页。
+            # 早先这里固定返回 999，壳会一直往下翻到空页才停。
+            return {'list': items, 'page': pg,
+                    'pagecount': pg + (1 if len(items) >= 24 else 0),
+                    'limit': 24, 'total': len(items)}
         except Exception:
             return {'list': [], 'page': 1, 'pagecount': 1, 'limit': 24, 'total': 0}
 
@@ -4125,8 +4176,50 @@ class JuZhiNative:
             return {'list': [], 'page': 1}
 
     # ---- AVBox 调用约定：playerContent 的 vipFlags 传 list
+    @staticmethod
+    def _is_direct(url):
+        """地址本身带视频扩展名，不用再验，直接交给播放器。"""
+        return bool(url) and bool(re.search(
+            r'(?i)\.(m3u8|mp4|flv|mkv|avi|ts|mov|mpd)(\?|$)', url))
+
+    @staticmethod
+    def _sniff(url):
+        """抓前几百字节判断这是不是真的媒体流。
+
+        站点有一半线路给的是 m.php?data=xxx 这种“跳转页”，普通 GET 回来的是
+        「Decrypt Failed」纯文本，播放器点了就是黑屏。这里先验一下，验不过就
+        当这条线没地址，交给上层自动换线。
+        """
+        try:
+            import ssl
+            req = urllib.request.Request(url, headers={'User-Agent': UA})
+            ctx = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=2.5, context=ctx) as r:
+                head = r.read(512)
+        except Exception:
+            return False
+        if not head:
+            return False
+        if head[:1] == b'\x47':                       # MPEG-TS
+            return True
+        if b'ftyp' in head[:16]:                      # mp4
+            return True
+        low = head.lstrip()[:400].lower()
+        if low.startswith(b'#extm3u') or low.startswith(b'<?xml') and b'mpd' in low:
+            return True
+        if low.startswith(b'<') or low.startswith(b'{') or low.startswith(b'['):
+            return False                              # 网页 / JSON 报错
+        try:
+            text = head.decode('utf-8')
+            if sum(1 for ch in text if ch.isprintable()) > len(text) * 0.98:
+                return False                          # 纯文本，多半是错误提示
+        except Exception:
+            return True                               # 解不出文本 → 当二进制流
+        return True
+
     def playerContent(self, flag, id, vipFlags=None):
         url = id or ''
+        failed = ''
         try:
             if id and not id.startswith('http') and not id.startswith('h$'):
                 jm = json.loads(base64.b64decode(id))
@@ -4159,12 +4252,30 @@ class JuZhiNative:
                                 got = mm.group(0).decode('utf-8', 'replace')
                         if got:
                             url = got
+                        # 接口自带失败原因（「解析视频地址失败 / 触发了防盗」）
+                        for fn, wt, v in _pb(data[0]):
+                            if fn == 9 and wt == 2:
+                                failed = v.decode('utf-8', 'replace')[:60]
+                                break
+                else:
+                    for fn, wt, v in top:
+                        if fn == 2 and wt == 2:
+                            failed = v.decode('utf-8', 'replace')[:60]
+                            break
             elif not url.startswith('http'):
                 url = 'http://'
         except Exception:
             pass
-        return {'parse': 0, 'playUrl': '', 'url': url,
-                'header': {'User-Agent': UA}}
+        # 解析出来的不是直链、又验不过 → 不下发假地址，让上层换线
+        if url.startswith('http') and url != 'http://' and not self._is_direct(url):
+            if not self._sniff(url):
+                failed = failed or '该线路地址已失效'
+                url = 'http://'
+        out = {'parse': 0, 'playUrl': '', 'url': url,
+               'header': {'User-Agent': UA}}
+        if failed and url == 'http://':
+            out['msg'] = '线路解析失败（%s），换一条线路试试' % failed
+        return out
 
     def localProxy(self, url):
         try:
@@ -6673,30 +6784,20 @@ def _sort_4k_first(vod):
 K = 'k:'
 # 官方/平台类线路（爱奇艺/腾讯/优酷…）基本都是空地址，换线时放最后试
 _BAD_HINT = ('官方', '专享', '爱奇艺', '腾讯', '优酷', '哔哩', '芒果', '搜狐')
-# yt=综合：分类取影探，搜索合并内嵌模块全部 11 个子源，详情合并所有线路
-# jn/sk/zj/fq 无分类页、sz 服务器已下线，都不再单独成站（内容仍可通过"综合"和详情线路看到）
-SRC = [('yt', '综合'), ('jx', '剧下饭'), ('gg', '咕噜'), ('ff', 'FoFo'), ('xf', '稀饭'),
-       ('xj', '小鸡'), ('4k', '4KMP'), ('pd', '片帝'), ('ht', '河豚')]
-
-# 内嵌模块还在后台解析（或解析失败）时，先用这份静态分类兜住首页，
-# 避免"打开站点一片空白"。名字不含源前缀，外层会自己拼。
-_KISHI_FALLBACK = {
-    'yt': [('yt|1', '最新电影'), ('yt|21', '热播国剧'), ('yt|3', '新外语片'), ('yt|25', '欧美剧'),
-           ('yt|56', '韩剧'), ('yt|22', '短剧'), ('yt|23', '国漫'), ('yt|24', '国综'),
-           ('yt|29', '少儿动画'), ('yt|20', '热门电影①'), ('yt|53', '热门电影②'), ('yt|57', '热门电影③')],
-    'jx': [('jx|22016', '电视剧'), ('jx|22017', '电影'), ('jx|22018', '动漫'), ('jx|22019', '综艺'),
-           ('jx|22020', '短剧'), ('jx|22021', '少儿'), ('jx|22022', '纪录片'), ('jx|22024', 'AI漫剧'),
-           ('jx|22023', '直播')],
-    'gg': [('gg|1', '电影'), ('gg|2', '电视剧'), ('gg|3', '综艺'), ('gg|4', '动漫'),
-           ('gg|5', '短剧'), ('gg|60', '直播')],
-    'ff': [('ff|dianying', '电影'), ('ff|dianshiju', '剧集'), ('ff|zongyi', '综艺'), ('ff|dongman', '动漫')],
-    'xf': [('xf|gg_new', '日漫·最新'), ('xf|gg_hot', '日漫·热门'), ('xf|gg_score', '日漫·高分'),
-           ('xf|gg_us', '欧美动漫')],
-    'xj': [('xj|c_movie', '电影'), ('xj|c_tv', '剧集'), ('xj|c_anime', '动漫'),
-           ('xj|c_show', '综艺'), ('xj|c_rank', '排行榜')],
-}
-
-DIAG_TID = K + '__diag:0'
+# 站点列表 = 实际出内容的源。历史上这里还挂过内嵌聚合模块的 6 个子源
+# （综合/剧下饭/咕噜/FoFo/稀饭/小鸡）和河豚，现在两者都拿不到数据了：
+#   * 内嵌模块（Kishuto）启动时要先从 gitee 拉一份配套数据来解包，
+#     仓库主人 tao060702 已被 gitee 封禁，raw 地址固定返回
+#     403 "the creator of this repository has been blocked"，永远等不到；
+#   * 河豚/华谊共用的 43.240.158.154:18004 直接拒连（Connection refused），
+#     首页只剩硬编码分类、分类页空空如也。
+# 与其把 7 个空分类摆在菜单里让人点进去看空白，不如只挂实测能用的：
+#   yt=影探（4K 直链 mp4，41 个分类）、gg=咕噜、jz=橘汁、pd=片帝、4k=4KMP
+SRC = [('yt', '影探'), ('gg', '咕噜'), ('jz', '橘汁'), ('pd', '片帝'), ('4k', '4KMP')]
+# 这几个源没有能用的搜索接口（4K-av 的 /s?z= 被 Cloudflare 拦），
+# 聚合搜索时直接跳过，省掉一次必然失败的超时等待
+_NOSEARCH = ('4k',)
+_SRC_LABEL = dict(SRC)
 
 
 def _split_tid(tid):
@@ -6777,24 +6878,27 @@ class Spider:
     def __init__(self):
         self.pool = {}
         self._lock = threading.Lock()
+        self._slot = {}       # 源 key → 建实例用的锁（同源只 init 一次，异源可并行）
         self._cache = {}
         self._lines = {}      # 详情 id → [(线路名, 首集播放id)]，用于同片换线兜底
         self._pid2vod = {}    # 播放 id → 详情 id
+        self._good_line = {}  # 源 key → 上次换线成功的线路名
         self._home = (0.0, None)
 
     def init(self, extend=''):
         _log('[init] py=%s extend=%r' % (sys.version.split()[0], extend))
-        # 后台预热各源，避免首次搜索因源初始化慢而漏掉站点
-        def _warm():
-            for _k, _n in SRC:
-                try:
-                    self._src(_k)
-                except Exception:
-                    pass
-        try:
-            threading.Thread(target=_warm, daemon=True).start()
-        except Exception:
-            pass
+        # 后台预热各源：每个源单开一条线程，谁慢谁自己慢，
+        # 不要排成一队——串行预热会让首屏等到"所有源 init 时间之和"（实测 11 秒）
+        def _warm_one(key):
+            try:
+                self._src(key)
+            except Exception:
+                pass
+        for _k, _n in SRC:
+            try:
+                threading.Thread(target=_warm_one, args=(_k,), daemon=True).start()
+            except Exception:
+                pass
 
     def getName(self):
         return '4k免扫聚合'
@@ -6825,46 +6929,55 @@ class Spider:
     def log(self, *a):
         _log(*a)
 
+    # 源 key → 实现类。同一个 key 只会命中一个实现，
+    # 历史上 yt/gg 会先命中内嵌模块（KISHI_SITES），导致本地写好的
+    # 影探/咕噜实现永远是死代码；现在本地实现优先。
+    _FACTORY = {
+        'yt': Yingtan, 'gg': Gulu, 'jz': JuZhiNative, 'pd': Piandi, '4k': FourKMP,
+        'ht': Hetun, 'hy': HuaYi, 'sz': ShanZha4K, 'gl': Gulu,
+    }
+
     def _src(self, key):
+        # 先无锁查一次：命中就直接拿走，避免所有调用都排在同一把锁上
         with self._lock:
             sp = self.pool.get(key)
             if sp:
                 return sp
-            try:
-                if key in KISHI_SITES:
-                    label = dict(SRC).get(key, key)
-                    sp = KishiSingle(key, label)
-                elif key == 'hy':
-                    sp = HuaYi()
-                elif key == 'yt':
-                    sp = Yingtan()
-                elif key == '4k':
-                    sp = FourKMP()
-                elif key == 'sz':
-                    sp = ShanZha4K()
-                elif key == 'pd':
-                    sp = Piandi()
-                elif key == 'jz':
-                    sp = JuZhiNative()
-                elif key == 'ht':
-                    sp = Hetun()
-                elif key == 'gl':
-                    sp = Gulu()
-                else:
-                    return None
-                sp.init('')
-                self.pool[key] = sp
+            slot = self._slot.get(key)
+            if slot is None:
+                slot = self._slot[key] = threading.Lock()
+        # 每个源一把锁：同一个源绝不会被并发 init 两次（咕噜重复握手会互相
+        # 顶掉会话，之后分类全空），不同源之间仍可并行
+        with slot:
+            with self._lock:
+                sp = self.pool.get(key)
+            if sp:
                 return sp
+            cls = self._FACTORY.get(key)
+            if cls is None and key not in KISHI_SITES:
+                return None
+            # init 放在锁外：咕噜的 init 要握手（3 秒级），
+            # 锁在里面会把其它源的首屏也一起卡住
+            try:
+                if cls is not None:
+                    sp = cls()
+                else:
+                    # 只剩兜底用途：万一以后内嵌模块又能加载了
+                    sp = KishiSingle(key, _SRC_LABEL.get(key, key))
+                sp.init('')
             except Exception:
                 return None
+            with self._lock:
+                self.pool[key] = sp
+            return sp
 
     def homeContent(self, filter=False):
         t0 = time.time()
         try:
             out = self._home_impl(filter)
-            _log('[home] %.2fs classes=%d hot=%d kishi=%s' % (
+            _log('[home] %.2fs classes=%d hot=%d' % (
                 time.time() - t0, len(out.get('class') or []),
-                len(out.get('list') or []), _KISHUTO_ERR or 'ok'))
+                len(out.get('list') or [])))
             return out
         except Exception:
             _log('[home] 异常 %.2fs\n%s' % (time.time() - t0, traceback.format_exc()))
@@ -6874,14 +6987,10 @@ class Spider:
     def _home_impl(self, filter=False):
         if not isinstance(filter, bool):
             filter = bool(filter)
-        # 壳通常会连着调 homeContent / homeVideoContent，缓存 2 分钟
-        # （内嵌模块加载失败时只缓存 30 秒，网络恢复后能自动回到真实分类）
+        # 壳通常会连着调 homeContent / homeVideoContent，结果缓存 2 分钟
         if not filter and self._home:
-            ttl = 30 if _KISHUTO_ERR else 120
-            if time.time() - self._home[0] < ttl:
+            if time.time() - self._home[0] < 120:
                 return self._home[1]
-        # 内嵌模块在后台线程里加载，这里只负责"催一下"，不等它
-        _kishi_start()
         keys = [k for k, _ in SRC]
 
         def work(key):
@@ -6911,20 +7020,15 @@ class Spider:
 
         classes = []
         hot = []
-        kishi_err = bool(_KISHUTO_ERR)
         for key, name in SRC:
             data = got.get(key) or {}
-            src_cls = list(data.get('class') or [])
-            if not src_cls and key in _KISHI_FALLBACK and not kishi_err:
-                # 内嵌模块还没解析完：先用静态分类占位，等它好了自动以真实分类为准
-                src_cls = [{'type_id': t, 'type_name': n} for t, n in _KISHI_FALLBACK[key]]
-            for c in src_cls:
+            for c in (data.get('class') or []):
                 tn = str(c.get('type_name') or '').strip()
-                if not tn:
+                tid = str(c.get('type_id') or '').strip()
+                if not tn or not tid:
                     continue
                 label = tn if tn.startswith(name + '·') else name + '·' + tn
-                classes.append({'type_id': K + key + ':' + str(c.get('type_id')),
-                                'type_name': label})
+                classes.append({'type_id': K + key + ':' + tid, 'type_name': label})
             if not hot:
                 for it in (data.get('list') or [])[:24]:
                     it = dict(it)
@@ -6933,9 +7037,6 @@ class Spider:
                         # 首页推荐必须补上站点前缀，否则点进去详情是空的
                         it['vod_id'] = K + key + ':0:' + vid
                     hot.append(it)
-        if kishi_err:
-            # 内嵌模块彻底加载失败时给一张说明卡，免得用户以为站点坏了又没线索
-            classes.insert(0, {'type_id': DIAG_TID, 'type_name': '诊断·内嵌源未加载'})
         if not classes:
             classes = [{'type_id': K + k + ':1', 'type_name': n} for k, n in SRC]
         out = {'class': classes, 'filters': {}, 'list': hot[:24]}
@@ -6988,17 +7089,6 @@ class Spider:
                 extend = {}
         if not isinstance(filter, bool):
             filter = bool(filter)
-        if key == '__diag':
-            txt = ('内嵌聚合模块没有加载成功：%s\n\n'
-                   '这个模块启动时要先去 gitee 拉一份配套数据才能解包，'
-                   '盒子连不上、TLS 证书异常或内存不足都会失败。\n'
-                   '其它源（4KMP / 片帝 / 河豚 等）不受影响；恢复联网后重新进入站点即可。'
-                   % (_KISHUTO_ERR or '加载超时'))
-            return {'list': [{'vod_id': tid, 'vod_name': '内嵌源未加载',
-                              'vod_pic': '', 'vod_remarks': '点开看原因',
-                              'vod_content': txt,
-                              'vod_play_from': '', 'vod_play_url': ''}],
-                    'page': 1, 'pagecount': 1, 'total': 1}
         sp = self._src(key)
         out = []
         page, pagecount, total = int(pg or 1), 1, 0
@@ -7019,6 +7109,10 @@ class Spider:
         return {'list': out, 'page': page, 'pagecount': pagecount,
                 'limit': 24, 'total': total or len(out)}
 
+    _SEARCH_BUDGET = 6.0     # 一个源都不回时的兜底上限
+    _SEARCH_GRACE = 2.5      # 够 8 条后再给慢源多久补齐
+    _SEARCH_SLOW = 4.0       # 有结果但不满 8 条时，最多再等这么久
+
     def searchContent(self, key_word, quick=False, pg='1'):
         key_word = (key_word or '').strip()
         page = max(1, int(pg or 1))
@@ -7029,24 +7123,27 @@ class Spider:
         if cached and time.time() - cached[0] < 300:
             return {'list': cached[1], 'page': page, 'pagecount': cached[2], 'total': cached[3]}
 
+        keys = [(k, n) for k, n in SRC if k not in _NOSEARCH]
         results = []
         seen_names = set()
         seen_ids = set()
-        with ThreadPoolExecutor(max_workers=len(SRC)) as pool:
+        started = time.time()
+        pool = ThreadPoolExecutor(max_workers=max(1, len(keys)))
+        try:
             futs = {}
-            for skey, sname in SRC:
+            for skey, sname in keys:
                 sp = self._src(skey)
                 if not sp:
                     continue
                 futs[pool.submit(self._search_one, sp, skey, key_word, page)] = skey
-            for f, skey in futs.items():
+
+            def take(f):
                 try:
-                    items = f.result(timeout=12) or []
+                    items = f.result() or []
                 except Exception:
-                    continue
+                    return
                 for it in items:
-                    # 同名只留一张卡：综合站排在前面，它的卡片（备注里带 [源名]）
-                    # 优先，各分站重复返回的同名片子不再重复插入
+                    # 同名只留一张卡，后面重复返回的同名片子不再插入
                     mark = re.sub(r'\s+', '', str(it.get('vod_name', '')).strip())
                     vid = it.get('vod_id', '')
                     if not mark or mark in seen_names:
@@ -7057,6 +7154,26 @@ class Spider:
                     if vid:
                         seen_ids.add(vid)
                     results.append(it)
+
+            # 先到先上：影探/咕噜都是零点几秒，够 8 条就只再等 2.5 秒收尾，
+            # 不再为了一个卡住（或正在被限流）的源把整页拖满 6 秒
+            while futs and time.time() - started < self._SEARCH_BUDGET:
+                for f in list(futs):
+                    if f.done():
+                        take(f)
+                        del futs[f]
+                spent = time.time() - started
+                if len(results) >= 8 and spent > self._SEARCH_GRACE:
+                    break
+                if results and spent > self._SEARCH_SLOW:
+                    break
+                if not futs:
+                    break
+                time.sleep(0.05)
+        except Exception:
+            pass
+        finally:
+            pool.shutdown(wait=False)
         pagecount = page + 1 if len(results) >= 8 else page
         total = max(len(results), 0)
         if len(self._cache) > 48:
@@ -7074,7 +7191,7 @@ class Spider:
                 if not it.get('vod_name'):
                     continue
                 it['vod_id'] = K + skey + ':0:' + str(it.get('vod_id', ''))
-                label = dict(SRC).get(skey, skey)
+                label = _SRC_LABEL.get(skey, skey)
                 remark = str(it.get('vod_remarks', '')).strip()
                 if remark.startswith('['):
                     it['vod_remarks'] = remark
@@ -7167,18 +7284,28 @@ class Spider:
             pass
 
     def _retry_same(self, pid, flag, vipFlags):
-        """同片换个线路再试（内嵌聚合源自带换源，这里只补 4KMP/片帝/河豚）。"""
+        """同片换个线路再试（内嵌聚合源自带换源，这里只补 4KMP/片帝 等）。"""
         vid = self._pid2vod.get(pid) or ''
         lines = self._lines.get(vid) or []
         if not lines:
             return None
-        # 官方/平台类线路基本都是空地址，先试自建线路
+        skey = (_split_vid(pid) or [''])[0]
+        good = self._good_line.get(skey, '')
+        # 官方/平台类线路基本都是空地址，先试自建线路；
+        # 同一个源上一次切换成功的线路优先（片帝这类站每条线都要现解析，
+        # 3 秒起步，少试两条就是省 6 秒）
         cand = [x for x in lines if x[1] != pid]
-        cand.sort(key=lambda x: (1 if any(k in str(x[0]) for k in _BAD_HINT) else 0))
-        deadline = time.time() + 10.0
+
+        def order(pair):
+            name = str(pair[0])
+            if good and name == good:
+                return 0
+            return 2 if any(k in name for k in _BAD_HINT) else 1
+        cand.sort(key=order)
+        deadline = time.time() + 7.0
         tried = 0
-        for f2, pid2 in cand[:6]:
-            if tried >= 4 or time.time() > deadline:
+        for f2, pid2 in cand[:5]:
+            if tried >= 3 or time.time() > deadline:
                 break
             tri = _split_vid(pid2)
             if not tri:
@@ -7190,6 +7317,7 @@ class Spider:
             try:
                 r = sp2.playerContent(f2, tri[2], vipFlags)
                 if isinstance(r, dict) and _ok(r):
+                    self._good_line[tri[0]] = f2
                     r['msg'] = '原线路无地址，已自动切到「%s」' % f2
                     return r
             except Exception:
