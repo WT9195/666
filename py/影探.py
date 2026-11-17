@@ -17,11 +17,31 @@
 #      随便取多条都是 HTTP 404（https 是 502 Bad Gateway，nginx 回源失败）。
 #      这不是脚本能修的，脚本改成：详情页把已确认失效的源站线路隐藏，播放时若仍命中给出明确提示，
 #      避免用户点进去只看到黑屏。
+#
+# 2026-11-16 线路实测与修复（本条全部结论来自实测请求）：
+#   1) 详情里 6 条线路中，4K(BD)/4K(YD) 两条是 ym4kjx.lyyytv.cn 的 mp4 直链，
+#      全站抽样 2864 条该域名直链无一例外 HTTP 404，源站已搬空 —— 脚本直接不上架。
+#   2) 腾讯/B站/爱奇艺/优酷 四个网页线路必须过解析。原来的解析接口 fys.lyyytv.cn
+#      现在 parsesId=1~40 全试过：5/6/7 返回 {"code":0,"msg":"解析失败"}，其余 HTTP 500，
+#      对腾讯/B站/爱奇艺/优酷任一地址都失败 —— 该解析站已停摆。
+#      同域另一个解析实例 4kzj.lyyytv.cn 实测可用：parsesId=1 对同一批地址全部返回
+#      code:200 且解出 baidu.con 加密串（解密后是真实 m3u8/mpd），故主解析改为它，
+#      fys 保留为兜底。
+#   3) 解析出来的地址并非都能播，实测分化很明显（8 部影片逐条验证首片）：
+#        腾讯    3/3 通（m3u8 首片 200/206，0.3~0.8MB/s）
+#        BL线路  4/4 通（B站 4096x1716 的 DASH mpd，首片 200）
+#        爱奇艺  0/6 通（清单 200，但分片 index*.ts 全部 404）
+#        优酷    0/4 通（同上）
+#      所以详情页改成「先真解析再验首片」，只把确实能出流的线路摆出来，
+#      并把实测分辨率/速度标在线路名后面；四条全挂时保留原线路并标注原因，
+#      不让详情页空着。
 import base64
 import json
 import re
 import time
 import urllib.parse
+
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeout
 
 # ======================= 依赖软导入 =======================
 # 原来是 requests / Crypto 硬导入：盒子里少装一个包，整个脚本直接 ImportError，
@@ -74,22 +94,28 @@ KEY = 'yingtan4k'
 HOST = 'http://cms.lyyytv.cn'
 CMS_KEY = 'wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy'
 
-# 解析接口（2026-10-31 实测：parsesId=3 已失效返回 HTTP 500，parsesId=5 可用）
-PARSE_API = 'http://fys.lyyytv.cn/api/index'
+# 解析接口（2026-11-16 实测：fys 全通道返回解析失败，改用 4kzj 的 parsesId=1）
+# 每个元素是 (解析服务地址, 该服务上可用的 parsesId 元组)，按顺序尝试
+PARSE_APIS = (
+    ('http://4kzj.lyyytv.cn/api/index', (1,)),
+    ('http://fys.lyyytv.cn/api/index', (5, 6, 7)),
+)
 PARSE_APPID = '10001'
-# 解析线路优先级：5 是当前唯一稳定出地址的；6、7 会快速返回「解析失败」，留作兜底
-PARSE_IDS = (5, 6, 7)
 HEADERS = {'User-Agent': 'okhttp/4.12.0'}
 # 解析请求/回源头：对齐 JS 的 PH，避免 gzip 花屏
 PARSE_HEADERS = {'User-Agent': 'okhttp/4.12.0', 'Accept-Encoding': 'identity'}
 
 # baidu.con 前缀加密常量（对齐 yt4k.js）
 DEC_PREFIX = 'https://baidu.con/'
-# 解析重试轮数与退避基数（秒）
-PARSE_ROUNDS = 2
-PARSE_BACKOFF = 0.3
+# 解析单次超时与重试退避（秒）
+PARSE_TIMEOUT = 6
+PARSE_BACKOFF = 0.4
 # 同一原始地址解析结果缓存窗口（秒）
 PLAY_CACHE_TTL = 120
+# 线路探测结果缓存窗口（秒）
+PROBE_CACHE_TTL = 600
+# 详情页最多探测多少条线路（并发上限同值）
+PROBE_LIMIT = 8
 
 PAGE_LIMIT = 20
 # 2026-10-31：nav 的 type_extend 实际还带 star/director/state/version，补上映射
@@ -113,6 +139,7 @@ _HOST_RE = re.compile(r'^https?://([^/]+)', re.I)
 _home_cache = {}
 _play_cache = {}
 _host_cache = {}
+_probe_cache = {}
 
 
 def text(value):
@@ -317,39 +344,73 @@ def resolve_parse(body):
     return candidate
 
 
-def parse_round(raw, parse_id):
-    """按指定 parsesId 解析一次，返回解出的真实地址（失败返回空串）。"""
+def parse_round(raw, parse_id, api=None):
+    """按指定解析服务/parsesId 解析一次。
+
+    返回 (状态, 地址)，状态取值：
+      'ok'    —— 解出可用地址
+      'fail'  —— 服务端明确答复解析不了（该 parsesId 不存在 / 通道挂了），
+                 这种情况换轮次重试也没用，直接跳过
+      'error' —— 网络层异常（超时/连接失败），值得重试
+    """
     if not HAS_REQUESTS:
-        return ''
+        return 'error', ''
+    api = api or PARSE_APIS[0][0]
     target = '%s?parsesId=%s&appid=%s&videoUrl=%s' % (
-        PARSE_API, parse_id, PARSE_APPID, urllib.parse.quote(raw, safe="!'()*"))
+        api, parse_id, PARSE_APPID, urllib.parse.quote(raw, safe="!'()*"))
     try:
-        rsp = requests.get(target, headers=PARSE_HEADERS, timeout=20)
-        # 2026-10-31：parsesId 失效时这里回的是 HTTP 500 的 ThinkPHP 错误页，
-        # 直接跳过，不做任何解析，避免把 HTML 当成地址。
-        if rsp.status_code != 200 or not rsp.text:
-            return ''
-        if 'System Error' in rsp.text[:2000]:
-            return ''
-        resolved = resolve_parse(rsp.text)
-        if resolved and resolved.startswith('http'):
-            return resolved
+        rsp = requests.get(target, headers=PARSE_HEADERS, timeout=PARSE_TIMEOUT)
     except Exception:
-        pass
-    return ''
+        return 'error', ''
+    # parsesId 失效时这里回的是 HTTP 500 的 ThinkPHP 错误页，直接跳过
+    if rsp.status_code != 200 or not rsp.text:
+        return ('fail' if rsp.status_code >= 500 else 'error'), ''
+    body = rsp.text
+    if 'System Error' in body[:2000]:
+        return 'fail', ''
+    if body.lstrip().startswith('{'):
+        try:
+            data = json.loads(body)
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            code = data.get('code')
+            if code is not None:
+                try:
+                    if int(code) != 200:
+                        # code=0 「解析失败」是明确答复，不必再重试
+                        return 'fail', ''
+                except (TypeError, ValueError):
+                    pass
+    resolved = resolve_parse(body)
+    if resolved and resolved.startswith('http'):
+        return 'ok', resolved
+    return 'fail', ''
 
 
 def parse_url(raw):
-    """对齐 JS play 内部：把原始地址拼到解析基址后请求，解出真实 URL。
-    多 parsesId + 多轮退避，任一成功即返回。"""
+    """把网页地址交给解析服务换成真实地址。
+
+    先按顺序把每个服务的每个 parsesId 试一遍；只有出现网络异常时，
+    才退避后再补一轮（服务端说「解析失败」的不重试，省掉1~2秒空等）。
+    """
     if not raw:
         return ''
-    for rnd in range(PARSE_ROUNDS):
-        if rnd > 0:
-            time.sleep(rnd * PARSE_BACKOFF)
-        for parse_id in PARSE_IDS:
-            resolved = parse_round(raw, parse_id)
-            if resolved:
+    erred = False
+    for api, ids in PARSE_APIS:
+        for parse_id in ids:
+            state, resolved = parse_round(raw, parse_id, api)
+            if state == 'ok':
+                return resolved
+            if state == 'error':
+                erred = True
+    if not erred:
+        return ''
+    time.sleep(PARSE_BACKOFF)
+    for api, ids in PARSE_APIS:
+        for parse_id in ids:
+            state, resolved = parse_round(raw, parse_id, api)
+            if state == 'ok':
                 return resolved
     return ''
 
@@ -391,6 +452,153 @@ def host_dead(url):
         dead = False
     _host_cache[host] = (now + HOST_CHECK_TTL, dead)
     return dead
+
+
+_RES_RE = re.compile(r'RESOLUTION=(\d+)x(\d+)', re.I)
+_MPD_SIZE_RE = re.compile(r'width="(\d+)"\s+height="(\d+)"', re.I)
+
+
+def _fetch_text(url, budget=6.0, cap=262144):
+    """限时取一段文本（清单动辄几百 KB，读够就断，别把详情页拖慢）。"""
+    rsp = requests.get(url, headers=HEADERS, timeout=budget, stream=True)
+    chunks = []
+    size = 0
+    try:
+        for piece in rsp.iter_content(32768):
+            if not piece:
+                break
+            chunks.append(piece)
+            size += len(piece)
+            if size >= cap:
+                break
+    finally:
+        try:
+            rsp.close()
+        except Exception:
+            pass
+    return rsp.status_code, b''.join(chunks).decode('utf-8', 'replace')
+
+
+def _quality(url, budget=6.0):
+    """真取一遍判断这条直链能否出流：返回 (ok, 宽, 高, KB/s, 说明)。
+
+    2026-11-16 实测：解析服务对上架地址并不保证能播 —— 腾讯返回的 m3u8 首片
+    200/206 正常，爱奇艺/优酷返回的 m3u8 清单正常但分片 index*.ts 全 404。
+    只看清单会把死线当成好线，所以这里一定要抓到首个分片才算通。
+    """
+    low = urllib.parse.urlparse(text(url)).path.lower()
+    headers = dict(HEADERS)
+    try:
+        if low.endswith('.mpd'):
+            code, body = _fetch_text(url, budget)
+            if code != 200 or '<MPD' not in body[:2000]:
+                return False, 0, 0, 0.0, 'mpd %s' % code
+            width = height = 0
+            for m in _MPD_SIZE_RE.finditer(body):
+                cw, ch = int(m.group(1)), int(m.group(2))
+                if cw * ch > width * height:
+                    width, height = cw, ch
+            return True, width, height, 0.0, 'mpd %dP' % height
+
+        if '.m3u8' in low:
+            code, body = _fetch_text(url, budget)
+            if code != 200 or '#EXTM3U' not in body:
+                return False, 0, 0, 0.0, 'list %s' % code
+            width = height = 0
+            for m in _RES_RE.finditer(body):
+                cw, ch = int(m.group(1)), int(m.group(2))
+                if cw * ch > width * height:
+                    width, height = cw, ch
+            if '#EXT-X-STREAM-INF' in body:  # 多档主清单：进最高档子清单
+                sub = ''
+                for ln in body.splitlines():
+                    s = ln.strip()
+                    if s and not s.startswith('#'):
+                        sub = s
+                        break
+                if sub:
+                    sub_url = urllib.parse.urljoin(url, sub)
+                    code2, body2 = _fetch_text(sub_url, budget)
+                    if code2 != 200 or '#EXTM3U' not in body2:
+                        return False, 0, 0, 0.0, 'sub %s' % code2
+                    body = body2
+                    url = sub_url
+            seg = ''
+            for ln in body.splitlines():
+                s = ln.strip()
+                if s and not s.startswith('#'):
+                    seg = s
+                    break
+            if not seg:
+                return False, 0, 0, 0.0, 'no seg'
+            seg_url = urllib.parse.urljoin(url, seg)
+            t0 = time.time()
+            rsp3 = requests.get(seg_url, headers=dict(headers, Range='bytes=0-131071'),
+                                timeout=budget)
+            got = rsp3.content or b''
+            dt = max(time.time() - t0, 0.001)
+            if rsp3.status_code not in (200, 206) or len(got) < 4096:
+                return False, 0, 0, 0.0, 'seg %s' % rsp3.status_code
+            return True, width, height, len(got) / 1024.0 / dt, 'm3u8 %dP' % height
+
+        t0 = time.time()
+        rsp = requests.get(url, headers=dict(headers, Range='bytes=0-131071'), timeout=budget)
+        got = rsp.content or b''
+        dt = max(time.time() - t0, 0.001)
+        if rsp.status_code not in (200, 206) or len(got) < 4096:
+            return False, 0, 0, 0.0, 'raw %s' % rsp.status_code
+        return True, 0, 0, len(got) / 1024.0 / dt, 'mp4'
+    except Exception as exc:
+        return False, 0, 0, 0.0, type(exc).__name__
+
+
+def probe_line(page_url):
+    """探测一条线路：直链直接验，网页地址先解析再验。返回 (ok, 直链, 宽, 高, KB/s, 说明)。"""
+    now = time.time()
+    hit = _probe_cache.get(page_url)
+    if hit and hit[0] > now:
+        return hit[1]
+    if is_media_url(page_url):
+        resolved, parsed = page_url, False
+    else:
+        resolved, parsed = parse_url(page_url), True
+    if not resolved:
+        result = (False, '', 0, 0, 0.0, '解析失败')
+    else:
+        ok, width, height, kbps, note = _quality(resolved)
+        result = (ok, resolved if ok else '', width, height, kbps, note)
+    _probe_cache[page_url] = (now + PROBE_CACHE_TTL, result)
+    if result[0] and parsed:
+        # 解析出的直链带时限，短时间内给 play() 复用
+        _play_cache[page_url] = (now + PLAY_CACHE_TTL, resolved)
+    return result
+
+
+def probe_many(pages, deadline=9.0):
+    """并发探测多条线路；到点没测完的就放弃（上层按「未测速」处理）。
+
+    解析服务偶尔会卡在超时上，一条卡住不该把整个详情页拖到十几秒。
+    """
+    out = {}
+    pages = [p for p in pages if p]
+    if not pages:
+        return out
+    pool = ThreadPoolExecutor(max_workers=min(PROBE_LIMIT, len(pages)))
+    futures = dict((pool.submit(probe_line, p), p) for p in pages)
+    try:
+        for fut in as_completed(futures, timeout=deadline):
+            page = futures[fut]
+            try:
+                out[page] = fut.result()
+            except Exception:
+                pass
+    except FutureTimeout:
+        pass
+    except Exception:
+        pass
+    finally:
+        pool.shutdown(wait=False)
+    return out
 
 
 def home(extend=''):
@@ -527,22 +735,76 @@ def detail(ids):
                 {'name': names[i] if i < len(names) else '', 'url': u}
                 for i, u in enumerate(text(vod.get('vod_play_url')).split('$$$'))
             ]
-        froms = []
-        urls = []
+        lines = []
         for index, source in enumerate(sources):
             if not isinstance(source, dict):
                 continue
             url = playlist(source.get('url'))
             if not url:
                 continue
-            # 2026-10-31：源站整域失效（实测 4K 直链域名全 404）的线路不上架，
-            # 否则用户点进去只会黑屏。健康检查结果按域名缓存，不影响其它线路。
             first_ep = text(url.split('#')[0].split('$')[-1])
-            if is_media_url(first_ep) and host_dead(first_ep):
-                continue
+            # 2026-11-16：4K 直链域名实测全 404（源站搬空），不再放进探测队列，
+            # 只在一条都播不了时作为兜底展示，并标注原因。
+            dead = is_media_url(first_ep) and host_dead(first_ep)
             name = text(source.get('name')) or text(source.get('code')) or '线路%d' % (index + 1)
-            froms.append(re.sub(r'[$#]', ' ', name))
-            urls.append(url)
+            lines.append({'name': re.sub(r'[$#]', ' ', name), 'url': url,
+                          'page': first_ep, 'dead': dead})
+        lines = lines[:PROBE_LIMIT]
+
+        # 只留下真能出流的线路，并把实测分辨率/速度标到名字上
+        todo = [it for it in lines if not it['dead']]
+        probed = probe_many([it['page'] for it in todo]) if (todo and HAS_REQUESTS) else {}
+
+        result_of = dict((id(it), (False, '', 0, 0, 0.0, '源站404'))
+                         for it in lines if it['dead'])
+        for it in todo:
+            result_of[id(it)] = probed.get(it['page']) or (False, '', 0, 0, 0.0, '未测')
+
+        def area(item):
+            pr = result_of[id(item)]
+            return pr[2] * pr[3]
+
+        good = [it for it in lines if result_of[id(it)][0]]
+        # 解析出地址但首片取不到（源站时好时坏）：排到已验证线路后面，不直接删
+        shaky = [it for it in lines
+                 if not result_of[id(it)][0] and result_of[id(it)][1]]
+        # 探测超时没结论的：保留但不排序，放最后
+        unknown = [it for it in lines
+                   if not result_of[id(it)][1] and result_of[id(it)][5] == '未测']
+        # 排序：像素面积大的在前（1080x608 这种非 16:9 按高度排会吃亏），同档比速度
+        good.sort(key=lambda it: (-area(it), -result_of[id(it)][4]))
+        shaky.sort(key=lambda it: (-area(it), -result_of[id(it)][4]))
+
+        def label(item, suffix=''):
+            pr = result_of[id(item)]
+            width, height, kbps = pr[2], pr[3], pr[4]
+            tag = ''
+            if width >= 3800 or height >= 2000:
+                tag = '4K'  # 4096x1716 这类宽银幕 4K，按高度算只有 1716，直接标 4K
+            elif height:
+                tag = '%dP' % height
+            if kbps:
+                tag = (tag + ' ' if tag else '') + '%.1fM/s' % (kbps / 1024.0)
+            name = item['name'] + (' · ' + tag if tag else '') + suffix
+            return re.sub(r'[$#]', ' ', name)
+
+        chosen = good + shaky + unknown
+        if chosen:
+            froms = [label(it, '' if result_of[id(it)][0] else
+                           ('（时好时坏）' if result_of[id(it)][1] else '（未测速）'))
+                     for it in chosen]
+            urls = [it['url'] for it in chosen]
+        else:
+            # 一条都验不通时不藏起来：保留原线路并标原因，总比详情页空着强
+            def why(item):
+                if item['dead']:
+                    return '（源站已失效）'
+                if result_of[id(item)][1]:
+                    return '（分片取不到）'
+                return '（解析失败）'
+
+            froms = [label(it, why(it)) for it in lines]
+            urls = [it['url'] for it in lines]
         vod['vod_play_from'] = '$$$'.join(froms)
         vod['vod_play_url'] = '$$$'.join(urls)
         lst.append(vod)
@@ -568,9 +830,10 @@ def search(key, pg):
 
 def play(play_id):
     """对齐 JS play：解析出真实地址再交播放器。
-    2026-10-31 修复要点：
+    2026-11-16 修复要点：
       - 直链（mp4/m3u8/mpd…）不再绕解析接口：解析接口对 mp4 直链只会回「解析失败」；
-      - 解析线路从 parsesId=3 换成 5（3 已 500），并保留 6/7 兜底；
+      - 解析服务从 fys 改成 4kzj（fys 现在全通道「解析失败」，实测），fys 留作兜底；
+      - 解析出来不等于能播，播放前再验一次首片；分片取不到时明确告知而不是黑屏；
       - 任何失败都返回结构合法的 dict 并带 msg，让壳能显示原因而不是白屏。
     """
     hint = deps_hint()
@@ -594,20 +857,34 @@ def play(play_id):
                     'msg': '影探4K：该线路源站已失效（HTTP 404），请换其它线路'}
         return {'parse': 0, 'url': original, 'header': dict(PARSE_HEADERS)}
 
-    # 解析结果缓存
+    # 网页线路：解析 + 验首片（详情页已经探过，命中缓存基本秒回）
     now = time.time()
     cached = _play_cache.get(original)
     if cached and cached[0] > now:
         return {'parse': 0, 'url': cached[1], 'header': dict(PARSE_HEADERS)}
 
-    resolved = parse_url(original)
-    if resolved:
-        _play_cache[original] = (now + PLAY_CACHE_TTL, resolved)
-        return {'parse': 0, 'url': resolved, 'header': dict(PARSE_HEADERS)}
+    if HAS_REQUESTS:
+        ok, resolved, _w, _h, _kbps, note = probe_line(original)
+        if ok and resolved:
+            return {'parse': 0, 'url': resolved, 'header': dict(PARSE_HEADERS)}
+        # 缓存里说不行时现场再来一次：同一条线换个 token 经常就活了，
+        # 免得一次抖动把线路判死 10 分钟
+        fresh = parse_url(original)
+        if fresh:
+            ok2, _w2, _h2, _kbps2, note2 = _quality(fresh, 5.0)
+            if ok2:
+                _play_cache[original] = (time.time() + PLAY_CACHE_TTL, fresh)
+                return {'parse': 0, 'url': fresh, 'header': dict(PARSE_HEADERS)}
+            return {'parse': 0, 'url': '', 'header': dict(PARSE_HEADERS),
+                    'msg': '影探4K：该线路已解析但源站分片取不到（%s），请换线路重试' % note2}
+    else:
+        resolved = parse_url(original)
+        if resolved:
+            return {'parse': 0, 'url': resolved, 'header': dict(PARSE_HEADERS)}
 
     # 解析整条链路失败：给出可读原因，等用户反馈具体线路
     return {'parse': 0, 'url': '', 'header': dict(PARSE_HEADERS),
-            'msg': '影探4K：解析失败（解析接口返回异常或该线路暂不可用），请换线路重试'}
+            'msg': '影探4K：解析失败（解析通道返回异常或该线路暂不可用），请换线路重试'}
 
 
 class Spider(Spider):
