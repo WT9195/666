@@ -83,22 +83,40 @@
       "changeable": 1
     },
     {
-      "name": "⭐咕噜┃影视",
+      "name": "💓橘汁┃4K",
+      "key": "橘汁",
+      "type": 3,
+      "api": "./py/橘汁.py",
+      "searchable":1,
+      "quickSearch":1,
+      "changeable":1
+    },
+    {
+      "name": "💓咕噜┃4K",
       "key": "咕噜",
       "type": 3,
       "api": "./py/咕噜.py",
-      "searchable": 1,
-      "quickSearch": 1,
-      "changeable": 1
+      "searchable":1,
+      "quickSearch":1,
+      "changeable":1
     },
     {
-      "name": "⭐橘汁┃视频",
-      "key": "橘汁",
+      "name": "💓看剧┃4K",
+      "key": "看剧",
       "type": 3,
-      "api": "./py/橘汁视频.py",
-      "searchable": 1,
-      "quickSearch": 1,
-      "changeable": 1
+      "api": "./py/看剧.py",
+      "searchable":1,
+      "quickSearch":1,
+      "changeable":1
+    },
+    {
+      "name": "💓Y5┃影院",
+      "key": "Y5影院",
+      "type": 3,
+      "api": "./py/Y5影院.py",
+      "searchable":1,
+      "quickSearch":1,
+      "changeable":1
     },
     {
       "name": "💓‍红果┃短剧",
@@ -240,9 +258,9 @@
       "key": "骚火",
       "type": 3,
       "api": "./py/骚火影视.py",
-      "searchable": 0,
-      "quickSearch": 0,
-      "changeable": 0
+      "searchable":1,
+      "quickSearch":1,
+      "changeable":1
     },
     {
       "name": "uaa┃🔞",
